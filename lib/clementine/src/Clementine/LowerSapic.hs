@@ -42,13 +42,24 @@ import           Control.Monad         (foldM)
 import           Control.Monad.Catch   (MonadThrow, MonadCatch)
 import qualified Data.Text             as T
 
+-- tamarin-prover-term
+import           Term.LTerm            (LVar(..), LSort(..))
+
 -- tamarin-prover-theory
 import qualified Theory                as Th
 import           Theory                ( OpenTheory, defaultOpenTheory
-                                       , prettyOpenTheory
+                                       , prettyOpenTranslatedTheory
+                                       , removeTranslationItems
                                        , TraceQuantifier(..) )
 import           Theory.ProofSkeleton  (unprovenLemma)
 import           Theory.Model.Formula  (ltrue, LNFormula)
+import           Theory.Text.Parser    (parseLemmaWithMacros)
+import           Theory.Sapic          ( PlainProcess
+                                       , Process(..)
+                                       , SapicAction(..)
+                                       , ProcessCombinator(..)
+                                       , SapicLVar(..)
+                                       )
 import           Text.PrettyPrint.Class (Doc, render)
 
 -- tamarin-prover-sapic
@@ -80,24 +91,142 @@ lowerProtocolSapic
   -> m OpenTheory
 lowerProtocolSapic p = do
   let th0 = defaultOpenTheory False
-  -- Add lemmas first; the walking skeleton has no process to add.
-  th1 <- foldM addLemmaOrFail th0 (concatMap (lowerQuery p) (protoVerify p))
-  -- Sapic.translate is a no-op when there is no process attached
-  -- (verified by reading lib/sapic/src/Sapic.hs:48-52). We still
-  -- call it so the pipeline shape matches the eventual non-trivial
-  -- case where we DO add a process.
-  Sapic.translate th1
+      -- One Sapic process for the whole protocol; principals are
+      -- composed in parallel under top-level replication.
+      proc = lowerProtocolToProcess p
+      th1  = Th.addProcess proc th0
+  th2 <- foldM addLemmaOrFail th1
+                   (concatMap (lowerQuery th1 p) (protoVerify p))
+  Sapic.translate th2
 
--- | Convenience: lower and pretty-print to a String containing the
--- generated .spthy text. This is what the @clemc@ driver writes to
--- disk when built with @--flag with-sapic@.
+-- | Convenience: lower, run Sapic translation, drop the source
+-- 'Theory.Sapic.PlainProcess' (so the resulting spthy contains the
+-- translated MSR rules but NOT the original process declaration —
+-- otherwise tamarin-prover would try to compile the process a
+-- second time and complain about duplicate rules), then pretty
+-- print and post-process for compatibility with older tamarin-prover
+-- binaries.
 lowerProtocolSapicText
   :: (MonadThrow m, MonadCatch m)
   => Protocol
   -> m String
 lowerProtocolSapicText p = do
   th <- lowerProtocolSapic p
-  pure (render (prettyOpenTheory th :: Doc))
+  let translated = removeTranslationItems th
+      raw        = render (prettyOpenTranslatedTheory translated :: Doc)
+  pure (compatibilityCleanup raw)
+
+-- | Strip rule annotations that the workspace pretty-printer
+-- (Tamarin 1.13.0) emits but that older Tamarin binaries (e.g. the
+-- 1.10.0 from Homebrew) reject. The annotations are purely cosmetic
+-- (color, role, process structure debug info) — removing them does
+-- not change proof semantics.
+--
+-- Specifically, we replace
+--
+-- @
+--   rule (modulo E) Foo[color=#ffffff, process="...", issapicrule,
+--                       role='Process']:
+-- @
+--
+-- with
+--
+-- @
+--   rule (modulo E) Foo:
+-- @
+--
+-- The bracket content can span multiple lines, so we cannot use a
+-- simple per-line @sed@. The state machine below tracks whether we
+-- are currently inside a rule-header bracket and elides everything
+-- between an opening @[@ and a closing @]:@ that follows a @rule@
+-- keyword.
+compatibilityCleanup :: String -> String
+compatibilityCleanup = unlines . go . lines
+  where
+    go :: [String] -> [String]
+    go []       = []
+    go (l:rest) =
+      case findRuleBracketStart l of
+        Nothing -> l : go rest
+        Just preAndOpen
+          -- Single-line case: closing `]:` is on the same line.
+          | hasClose l ->
+              let cleaned = preAndOpen ++ ":"
+              in cleaned : go rest
+          -- Multi-line case: consume continuation lines until we hit `]:`.
+          | otherwise ->
+              let (_skipped, after) = break hasClose rest
+                  cleaned           = preAndOpen ++ ":"
+              in case after of
+                   []      -> cleaned : go rest    -- malformed; bail safely
+                   (_:tl)  -> cleaned : go tl
+
+    -- A rule bracket starts at a line that contains "rule " followed
+    -- by an identifier and an immediate '['. We return the prefix
+    -- "  rule (modulo E) Foo" (without the trailing '[') if so.
+    findRuleBracketStart :: String -> Maybe String
+    findRuleBracketStart line
+      | not ("rule" `isInfixOf'` line) = Nothing
+      | otherwise = case break (== '[') line of
+          (pre, '[':_) | "rule" `isInfixOf'` pre -> Just pre
+          _                                      -> Nothing
+
+    hasClose :: String -> Bool
+    hasClose l = "]:" `isInfixOf'` l
+
+    -- Local isInfixOf for [Char] to avoid pulling in Data.List qualified.
+    isInfixOf' :: String -> String -> Bool
+    isInfixOf' needle haystack
+      | length needle > length haystack = False
+      | take (length needle) haystack == needle = True
+      | otherwise = case haystack of
+          []     -> False
+          (_:xs) -> isInfixOf' needle xs
+
+--------------------------------------------------------------------------------
+-- Process construction
+--
+-- Each Clementine 'Principal' becomes one Sapic process under top-
+-- level replication: `! new ~ltk1; new ~ltk2; ... ; 0`. The principals
+-- are then composed in parallel.
+--
+-- This is the next-smallest step up from "no process at all": it
+-- exercises 'Sapic.translate's heavy code path (so we know the
+-- machinery is wired up) without needing to encode the full step
+-- semantics yet. Subsequent commits add step bodies to the tail of
+-- each principal's process.
+--------------------------------------------------------------------------------
+
+lowerProtocolToProcess :: Protocol -> PlainProcess
+lowerProtocolToProcess p = parallelOf (map lowerPrincipal (protoPrincipals p))
+  where
+    -- Balance the parallel tree to avoid quadratic proof shape on
+    -- protocols with many principals.
+    parallelOf :: [PlainProcess] -> PlainProcess
+    parallelOf []  = ProcessNull mempty
+    parallelOf [x] = x
+    parallelOf xs  =
+      let (l, r) = splitAt (length xs `div` 2) xs
+      in  ProcessComb Parallel mempty (parallelOf l) (parallelOf r)
+
+-- | Lower one principal to `! new ~ltk1; new ~ltk2; ...; 0`.
+lowerPrincipal :: Principal -> PlainProcess
+lowerPrincipal pr =
+    ProcessAction Rep mempty
+      $ withFreshKeys
+          [n | KGenerates n _ <- prinKnows pr]
+          (ProcessNull mempty)
+  where
+    withFreshKeys []     k = k
+    withFreshKeys (n:ns) k =
+      ProcessAction (New (mkSapicVar n)) mempty (withFreshKeys ns k)
+
+-- | Build a fresh-sorted Sapic variable from a Clementine identifier.
+-- We pick LSortFresh because every Clementine `generates` corresponds
+-- to a Tamarin Fr() premise.
+mkSapicVar :: T.Text -> SapicLVar
+mkSapicVar name =
+  SapicLVar (LVar (T.unpack name) LSortFresh 0) Nothing
 
 --------------------------------------------------------------------------------
 -- Lemma generation
@@ -105,19 +234,19 @@ lowerProtocolSapicText p = do
 
 -- | Lower one verify query to one or more lemmas.
 --
--- Walking-skeleton implementation: every query becomes a trivial
--- @True@ lemma named after the query. The lemma name is taken from
--- the same scheme as 'Clementine.Lower.summarizeQuery' so the
--- generated theory and the source-map sidecar agree.
+-- Status: most queries still produce trivial @True@ lemmas (the
+-- walking skeleton). The exception is 'QExecutable', which is the
+-- first query to use a real formula — it asserts that the protocol
+-- starts at all by quantifying over the @Init@ action fact that
+-- Sapic emits at the head of every translated process.
 --
--- The next iteration of this function will instantiate the §2.3
--- templates (Secret/Running/Commit/etc.) instead of @ltrue@. Doing
--- it that way means each upgrade is a strict improvement: the
--- pipeline stays valid, and any lemma that we have not yet ported
--- still emits a runnable (if uninteresting) skeleton.
-lowerQuery :: Protocol -> Query -> [Th.Lemma Th.ProofSkeleton]
-lowerQuery _ q = case q of
-  QExecutable _              -> [trivial "executable"        ExistsTrace]
+-- The next iteration replaces the trivial cases with the §2.3
+-- templates (Secret/Running/Commit/etc.). Each upgrade is strict:
+-- the pipeline stays valid, and any lemma not yet ported still
+-- emits a runnable (if uninteresting) skeleton.
+lowerQuery :: OpenTheory -> Protocol -> Query -> [Th.Lemma Th.ProofSkeleton]
+lowerQuery th _ q = case q of
+  QExecutable _              -> [executable th]
   QSecrecy t _               -> [trivial ("secrecy_"   <> name t) AllTraces]
   QForwardSecrecy t _        -> [trivial ("fs_"        <> name t) AllTraces]
   QInjAgreement i r _ _      -> [trivial ("inj_agree_" <> sId i r) AllTraces]
@@ -131,6 +260,31 @@ lowerQuery _ q = case q of
     -- left unproven; tamarin-prover will discharge it trivially.
     trivial :: String -> TraceQuantifier -> Th.Lemma Th.ProofSkeleton
     trivial nm qua = unprovenLemma nm [] qua (ltrue :: LNFormula)
+
+-- | The executable lemma: assert that some honest run actually
+-- starts. We quantify over the @Init@ action fact that
+-- 'Sapic.Basetranslation' emits at the head of every translated
+-- process — so as soon as we have a non-empty process, this lemma
+-- is provable by witnessing the trace that fires the @Init@ rule.
+--
+-- Built by parsing the lemma source through the existing
+-- 'parseLemmaWithMacros' instead of constructing a 'ProtoFormula'
+-- AST by hand. The risk of the parser ever rejecting our hard-coded
+-- string is low — if it does, the @error@ surfaces immediately at
+-- compile-time of the first @clemc@ run rather than silently
+-- producing wrong proofs.
+executable :: OpenTheory -> Th.Lemma Th.ProofSkeleton
+executable th =
+  case parseLemmaWithMacros th lemmaSrc of
+    Left e  -> error ("Clementine.LowerSapic.executable: internal: \
+                      \failed to parse hard-coded executable lemma: "
+                      ++ show e)
+    Right l -> l
+  where
+    lemmaSrc =
+      "lemma executable:\n\
+      \  exists-trace\n\
+      \  \"Ex #i. Init() @ #i\""
 
 addLemmaOrFail
   :: MonadThrow m => OpenTheory -> Th.Lemma Th.ProofSkeleton -> m OpenTheory
