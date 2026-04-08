@@ -281,13 +281,35 @@ lowerProtocolToProcess :: Protocol -> PlainProcess
 lowerProtocolToProcess = lowerProtocolToProcess'
 
 lowerProtocolToProcess' :: Protocol -> PlainProcess
-lowerProtocolToProcess' p = parallelOf
-  [ lowerPrincipal principalNames placements (protoSteps p) prin
-  | prin <- protoPrincipals p
-  ]
+lowerProtocolToProcess' p =
+    -- Generate every long-term key at the PROTOCOL level (above
+    -- the per-principal replication) so that all principals share
+    -- the same fresh names. This is what makes peer public-key
+    -- references unify across sides:
+    --
+    --     A's `aenc(_, pkR)` ≡ `aenc(_, pk(~skR))`
+    --     R's `adec(_, ~skR)` ≡ unifies with the same `~skR`
+    --
+    -- The earlier per-principal layout broke this because each
+    -- principal generated its own ~skR independently.
+    foldr withFreshLtk
+      (parallelOf
+        [ lowerPrincipal principalNames placements pkMap (protoSteps p) prin
+        | prin <- protoPrincipals p
+        ])
+      allLongTermKeys
   where
-    principalNames = map prinName (protoPrincipals p)
-    placements     = computeAgreementPlacements p
+    principalNames    = map prinName (protoPrincipals p)
+    placements        = computeAgreementPlacements p
+    allLongTermKeys   = nubText
+                          [ n
+                          | prin <- protoPrincipals p
+                          , KGenerates n _ <- prinKnows prin
+                          ]
+    pkMap             = computePubKeyMap (protoPrincipals p)
+
+    withFreshLtk n acc =
+      ProcessAction (New (mkSapicVar n)) mempty acc
 
     parallelOf :: [PlainProcess] -> PlainProcess
     parallelOf []  = ProcessNull mempty
@@ -295,6 +317,37 @@ lowerProtocolToProcess' p = parallelOf
     parallelOf xs  =
       let (l, r) = splitAt (length xs `div` 2) xs
       in  ProcessComb Parallel mempty (parallelOf l) (parallelOf r)
+
+    nubText :: [T.Text] -> [T.Text]
+    nubText = go Set.empty
+      where
+        go _    []     = []
+        go seen (x:xs)
+          | x `Set.member` seen = go seen xs
+          | otherwise           = x : go (Set.insert x seen) xs
+
+-- | Walk every principal block and collect the global public-key
+-- map. For each declaration of the form
+--
+-- @
+--   knows public pkR = PK(skR)
+-- @
+--
+-- record the binding @pkR -> skR@. Subsequent references to @pkR@
+-- from /any/ principal will resolve to @pk(~skR)@ instead of an
+-- opaque public constant.
+--
+-- The same key may be declared in multiple principals (e.g. both
+-- @principal A@ and @principal B@ might say @pkA = PK(skA)@); we
+-- collapse duplicates by keeping the first occurrence.
+computePubKeyMap :: [Principal] -> M.Map T.Text T.Text
+computePubKeyMap = M.fromListWith (\_ x -> x) . concatMap forPrincipal
+  where
+    forPrincipal pr =
+      [ (pubName, skName)
+      | KKnowsPublic pubName (Just (EApp OpPK [EVar skName _] _)) _
+          <- prinKnows pr
+      ]
 
 -- | Compute, for every verify-block agreement query, where the
 -- corresponding 'Running'/'Commit' events should be emitted in the
@@ -352,52 +405,41 @@ computeAgreementPlacements p =
     catMaybesPair :: [Maybe a] -> [a]
     catMaybesPair = mapMaybe id
 
--- | Lower one principal: long-term key freshes (each followed by
--- a 'KeyGen' event so aliveness lemmas can quantify over them),
--- then the sequence of step actions belonging to this principal
--- (as sender, receiver, or local actor), all wrapped in top-level
--- replication.
+-- | Lower one principal: emit per-session @KeyGen@ events for the
+-- long-term keys (which are 'new'-bound at the protocol level
+-- above this 'Rep'), then the step sequence, all wrapped in
+-- replication and an NDC reveal branch.
+--
+-- The long-term key freshes are NOT generated here; they live at
+-- the protocol level so all principals share the same names.
 lowerPrincipal
   :: [T.Text]
   -> M.Map (T.Text, T.Text) [AgreementEvent]
+  -> M.Map T.Text T.Text
   -> [Step]
   -> Principal
   -> PlainProcess
-lowerPrincipal principalNames placements allSteps pr =
+lowerPrincipal principalNames placements pkMap allSteps pr =
     ProcessAction Rep mempty
-      $ withFreshKeysAndKeyGen [n | KGenerates n _ <- prinKnows pr]
-      $ stepSequence ctx0 (relevantSteps (prinName pr) allSteps)
-      $ ProcessNull mempty
+      $ keyGenEvents
+      $ ProcessComb NDC mempty
+          (stepSequence ctx0 (relevantSteps (prinName pr) allSteps)
+                         (ProcessNull mempty))           -- left: protocol
+          (revealBranch (prinName pr) (map mkSapicVar genKeys))  -- right: reveal
   where
-    -- For each long-term key, emit `new ~k` immediately followed by
-    -- `event KeyGen(<principal>, ~k)`. The KeyGen action fact is
-    -- what design step 2 §2.3.5 (Lowe aliveness) quantifies over.
-    --
-    -- After the last `new`, insert an NDC (non-deterministic
-    -- choice): one branch continues with the normal protocol, the
-    -- other reveals the long-term keys via an `event Reveal($P)`
-    -- followed by `out(~k1); ... out(~kn); 0`. The two branches
-    -- share the same fresh names, so the lemma's compromise-excuse
-    -- clause has a real witness without diverging the protocol's
-    -- session identity from the reveal session.
-    withFreshKeysAndKeyGen freshes k =
-      let allLtks = map mkSapicVar freshes
-      in  buildKeysAndKeyGens freshes allLtks
-            (ProcessComb NDC mempty
-                k                                       -- left: protocol
-                (revealBranch (prinName pr) allLtks))   -- right: reveal
+    genKeys = [n | KGenerates n _ <- prinKnows pr]
 
-    -- Recursively emit `new ~k1; event KeyGen(_, ~k1); new ~k2; ...`
-    -- and finally hand off to the continuation `cont`.
-    buildKeysAndKeyGens []     _      cont = cont
-    buildKeysAndKeyGens (n:ns) (v:vs) cont =
-      let rest = buildKeysAndKeyGens ns vs cont
-          keyGenEvt = ProcessAction
-                        (Event (keyGenFact (prinName pr) n))
-                        mempty
-                        rest
-      in  ProcessAction (New v) mempty keyGenEvt
-    buildKeysAndKeyGens (_:_) [] _ = ProcessNull mempty   -- impossible
+    -- For each long-term key generated by this principal, emit a
+    -- `KeyGen($P, ~k)` event so aliveness lemmas can witness it.
+    keyGenEvents k =
+      foldr
+        (\n acc ->
+            ProcessAction
+              (Event (keyGenFact (prinName pr) n))
+              mempty
+              acc)
+        k
+        genKeys
 
     ctx0 = LowerCtx
       { lcReceived         = Set.empty
@@ -406,6 +448,7 @@ lowerPrincipal principalNames placements allSteps pr =
           [n | KKnowsPublic n _ _ <- prinKnows pr]
       , lcCurrentPrincipal = prinName pr
       , lcAgreementMap     = placements
+      , lcPubKeyMap        = pkMap
       }
 
 -- | @KeyGen(<principal>, <ltk>)@ event fact.
@@ -463,6 +506,17 @@ data LowerCtx = LowerCtx
     -- continuation. Computed once per protocol from the verify
     -- block, then consulted during step lowering.
     lcAgreementMap :: !(M.Map (T.Text, T.Text) [AgreementEvent])
+  , -- | Global public-key map: maps a @knows public@ identifier to
+    -- the underlying long-term key name (when the user wrote
+    -- @knows public pkR = PK(skR)@). Subsequent references to the
+    -- public key resolve to @pk(~skR)@ instead of an opaque
+    -- public constant, so encryption to a peer's public key
+    -- actually unifies with the peer's @adec(_, ~skR)@ equation.
+    --
+    -- Populated at protocol level from /every/ principal block
+    -- that declares such an equation, then shared across all
+    -- principals' lowering contexts.
+    lcPubKeyMap :: !(M.Map T.Text T.Text)
   }
 
 -- | A Running or Commit event placed by 'computeAgreementPlacements'
@@ -675,12 +729,29 @@ secretFact ctx n =
 
 -- | Resolve a Clementine identifier to a Sapic term according to
 -- the lowering context.
+--
+-- Resolution order (first match wins):
+--
+--   1. Principal name → public constant (e.g. @\'A\'@, @\'B\'@).
+--   2. Public-key with a known underlying secret → @pk(~secret)@.
+--      This is the case for @knows public pkR = PK(skR)@: the
+--      reference to @pkR@ from any principal (including ones that
+--      do NOT have @skR@ in their own block) lowers to
+--      @pk(~skR)@, which is the SAME term that @principal R@ uses
+--      after registering @~skR@ at the protocol level. This is
+--      what enables @adec@ on the receiver side to unify with
+--      @aenc@ on the sender side.
+--   3. Public param with no equation → opaque public constant.
+--   4. Received (peer-bound) variable → @pat@-prefixed Sapic var.
+--   5. Otherwise → fresh-sorted Sapic variable.
 resolveVar :: LowerCtx -> T.Text -> SapicNTerm SapicLVar
 resolveVar ctx n
-  | n `Set.member` lcPrincipalNames ctx = pubTerm (T.unpack n)
-  | n `Set.member` lcPublicParams   ctx = pubTerm (T.unpack n)
-  | n `Set.member` lcReceived ctx       = varTerm (mkPatVar n)
-  | otherwise                           = varTerm (mkSapicVar n)
+  | n `Set.member` lcPrincipalNames ctx     = pubTerm (T.unpack n)
+  | Just sk <- M.lookup n (lcPubKeyMap ctx) = fAppNoEq pkSym
+                                                [varTerm (mkSapicVar sk)]
+  | n `Set.member` lcPublicParams   ctx     = pubTerm (T.unpack n)
+  | n `Set.member` lcReceived ctx           = varTerm (mkPatVar n)
+  | otherwise                               = varTerm (mkSapicVar n)
   where
     mkPatVar nm = SapicLVar (LVar ("pat" ++ capitalize (T.unpack nm)) LSortFresh 0) Nothing
     capitalize ""     = ""
@@ -776,9 +847,11 @@ lowerPrimApp op args = case op of
 lowerExprPat :: LowerCtx -> Expr -> SapicNTerm SapicLVar
 lowerExprPat ctx e = case e of
   EVar n _
-    | n `Set.member` lcPrincipalNames ctx -> pubTerm (T.unpack n)
-    | n `Set.member` lcPublicParams   ctx -> pubTerm (T.unpack n)
-    | otherwise                           -> varTerm (mkPatVar n)
+    | n `Set.member` lcPrincipalNames ctx     -> pubTerm (T.unpack n)
+    | Just sk <- M.lookup n (lcPubKeyMap ctx) -> fAppNoEq pkSym
+                                                  [varTerm (mkSapicVar sk)]
+    | n `Set.member` lcPublicParams   ctx     -> pubTerm (T.unpack n)
+    | otherwise                               -> varTerm (mkPatVar n)
   EConst c _     -> pubTerm (T.unpack c)
   ETup [] _      -> pubTerm "unit"
   ETup [x] _     -> lowerExprPat ctx x
