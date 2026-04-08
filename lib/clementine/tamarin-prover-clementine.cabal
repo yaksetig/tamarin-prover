@@ -75,6 +75,7 @@ library
       , Clementine.SourceMap
 
     if flag(with-sapic)
+        cpp-options: -DWITH_SAPIC
         build-depends:
             tamarin-prover-utils
           , tamarin-prover-term

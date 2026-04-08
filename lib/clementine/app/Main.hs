@@ -55,7 +55,9 @@ usage = mapM_ (hPutStrLn stderr)
   , "  clemc --help               this message"
   ]
 
--- | @clemc <path>@: parse, lower, write the source map.
+-- | @clemc <path>@: parse, lower, write the source map. When this
+-- @clemc@ was built with @--flag with-sapic@, ALSO write a real
+-- @.spthy@ file via 'compileFileToSpthy'.
 runCompile :: FilePath -> IO ()
 runCompile path = do
   result <- compileFile path
@@ -74,7 +76,25 @@ runCompile path = do
       let sm = buildSourceMap path ct
       writeSourceMap path sm
       putStrLn $ "  source map: " ++ path ++ ".sourcemap.json"
+
+      -- If this build has the Sapic backend compiled in, also
+      -- produce a real .spthy file at <path>.spthy.
+      if withSapic
+        then writeSpthy path
+        else pure ()
       exitSuccess
+
+writeSpthy :: FilePath -> IO ()
+writeSpthy path = do
+  result <- compileFileToSpthy path
+  case result of
+    Left err -> do
+      T.hPutStr stderr (renderError err)
+      hPutStrLn stderr "  (continuing — .clem compilation succeeded)"
+    Right spthy -> do
+      let outPath = path ++ ".spthy"
+      writeFile outPath spthy
+      putStrLn $ "  spthy:      " ++ outPath
 
 -- | @clemc --explain CODE@: look up the long-form explanation.
 runExplain :: String -> IO ()
