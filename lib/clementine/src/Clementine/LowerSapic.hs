@@ -264,8 +264,12 @@ lowerProtocolToProcess = lowerProtocolToProcess'
 
 lowerProtocolToProcess' :: Protocol -> PlainProcess
 lowerProtocolToProcess' p = parallelOf
-  [ lowerPrincipal (protoSteps p) prin | prin <- protoPrincipals p ]
+  [ lowerPrincipal principalNames (protoSteps p) prin
+  | prin <- protoPrincipals p
+  ]
   where
+    principalNames = map prinName (protoPrincipals p)
+
     parallelOf :: [PlainProcess] -> PlainProcess
     parallelOf []  = ProcessNull mempty
     parallelOf [x] = x
@@ -276,16 +280,47 @@ lowerProtocolToProcess' p = parallelOf
 -- | Lower one principal: long-term key freshes, then the sequence
 -- of step actions belonging to this principal (as sender, receiver,
 -- or local actor), all wrapped in top-level replication.
-lowerPrincipal :: [Step] -> Principal -> PlainProcess
-lowerPrincipal allSteps pr =
+lowerPrincipal :: [T.Text] -> [Step] -> Principal -> PlainProcess
+lowerPrincipal principalNames allSteps pr =
     ProcessAction Rep mempty
       $ withFreshKeys [n | KGenerates n _ <- prinKnows pr]
-      $ stepSequence (relevantSteps (prinName pr) allSteps)
+      $ stepSequence ctx0 (relevantSteps (prinName pr) allSteps)
       $ ProcessNull mempty
   where
     withFreshKeys []     k = k
     withFreshKeys (n:ns) k =
       ProcessAction (New (mkSapicVar n)) mempty (withFreshKeys ns k)
+
+    ctx0 = LowerCtx
+      { lcReceived       = Set.empty
+      , lcPrincipalNames = Set.fromList principalNames
+      , lcPublicParams   = Set.fromList
+          [n | KKnowsPublic n _ _ <- prinKnows pr]
+      }
+
+-- | Per-principal walking context. Carries:
+--
+--   * @lcReceived@   — variable names that this principal has
+--                      received from a peer in an earlier step.
+--                      Subsequent references to these names use the
+--                      @pat_@-prefixed Sapic variable instead of the
+--                      sender's local name (since on this
+--                      principal's side, the wire-bound variable is
+--                      'patFoo' and not 'foo').
+--   * @lcPrincipalNames@ — the set of principal identifiers in the
+--                      protocol. Identifiers that match a principal
+--                      lower to public constants ('A', 'B', ...)
+--                      instead of fresh variables.
+--   * @lcPublicParams@ — the set of @knows public@ identifiers in
+--                      this principal's block (e.g. peer keys
+--                      @pkA@, @pkB@). They lower to public constants
+--                      so the rules don't reference them as unbound
+--                      fresh variables.
+data LowerCtx = LowerCtx
+  { lcReceived       :: !(Set.Set T.Text)
+  , lcPrincipalNames :: !(Set.Set T.Text)
+  , lcPublicParams   :: !(Set.Set T.Text)
+  }
 
 -- | The role this principal plays in a given step.
 data StepRole = RSender | RReceiver | RLocalActor
@@ -303,9 +338,18 @@ relevantSteps p = mapMaybe pick
           StepNetwork tgt _ | tgt == p -> Just (s, RReceiver)
           _                            -> Nothing
 
-stepSequence :: [(Step, StepRole)] -> PlainProcess -> PlainProcess
-stepSequence []           k = k
-stepSequence ((s,r):rest) k = lowerStep s r (stepSequence rest k)
+stepSequence :: LowerCtx -> [(Step, StepRole)] -> PlainProcess -> PlainProcess
+stepSequence _   []           k = k
+stepSequence ctx ((s,r):rest) k =
+  -- After a receive, the variables in the sent expression become
+  -- "received" on this principal's side and any subsequent
+  -- reference to them must use the pat_-prefixed name. Sender and
+  -- local steps do not change the context.
+  let ctx' = case r of
+        RReceiver -> ctx { lcReceived = lcReceived ctx
+                                       <> collectVarsBody (stepBody s) }
+        _         -> ctx
+  in  lowerStep ctx s r (stepSequence ctx' rest k)
 
 -- | Lower one step from one principal's perspective.
 --
@@ -317,14 +361,14 @@ stepSequence ((s,r):rest) k = lowerStep s r (stepSequence rest k)
 --     requires, claims) and do not happen on the receiver. This is
 --     the standard message-passing semantics from design step 2.
 --   * Local actor: same as sender but no 'out'.
-lowerStep :: Step -> StepRole -> PlainProcess -> PlainProcess
-lowerStep s role = case role of
+lowerStep :: LowerCtx -> Step -> StepRole -> PlainProcess -> PlainProcess
+lowerStep ctx s role = case role of
   RSender     -> foldSenderStmts (stepBody s)
   RLocalActor -> foldSenderStmts (stepBody s)
   RReceiver   -> emitReceive (stepBody s)
   where
     foldSenderStmts []     k = k
-    foldSenderStmts (x:xs) k = lowerStmt role x (foldSenderStmts xs k)
+    foldSenderStmts (x:xs) k = lowerStmt ctx role x (foldSenderStmts xs k)
 
     -- The receiver only consumes the wire message. We find the
     -- (single) 'SSend' in the body and emit a 'ChIn' for it. If
@@ -334,18 +378,38 @@ lowerStep s role = case role of
       []      -> k
       (e : _) ->
         ProcessAction
-          (ChIn Nothing (lowerExprPat e) Set.empty)
+          (ChIn Nothing (lowerExprPat ctx e) Set.empty)
           mempty
           k
 
+-- | Collect the variable names that a /receiver/ binds when it
+-- consumes the wire message of a step. Only the @SSend@'s
+-- expression matters: the @new@/@let@/@require@/@claim@
+-- statements are sender-side computation and do not introduce any
+-- bindings on the receiver.
+collectVarsBody :: [StepStmt] -> Set.Set T.Text
+collectVarsBody = foldMap go
+  where
+    go (SSend e _) = collectVarsExpr e
+    go _           = Set.empty
+
+collectVarsExpr :: Expr -> Set.Set T.Text
+collectVarsExpr e = case e of
+  EVar n _       -> Set.singleton n
+  EConst _ _     -> Set.empty
+  ETup xs _      -> foldMap collectVarsExpr xs
+  EApp _ xs _    -> foldMap collectVarsExpr xs
+  EExp a b _     -> collectVarsExpr a <> collectVarsExpr b
+
 -- | Lower a single statement of a step body.
 --
--- v0.1 implementation: handles 'SNew', 'SLet', 'SSend', 'SClaim'.
--- 'SRequire' is currently a no-op — the receiver-side equality
--- check it should emit needs the verify(...) function symbol from
--- the active builtin signature, which is the next iteration.
-lowerStmt :: StepRole -> StepStmt -> PlainProcess -> PlainProcess
-lowerStmt role stmt k = case stmt of
+-- v0.2 coverage: 'SNew', 'SLet', 'SSend', 'SClaim', and 'SRequire'
+-- (the latter is now a real CondEq guard, gated on the equality
+-- verify(...) = true). Variable references inside the body
+-- correctly distinguish between locally-fresh names, peer-received
+-- names, and principal identifiers via the 'LowerCtx'.
+lowerStmt :: LowerCtx -> StepRole -> StepStmt -> PlainProcess -> PlainProcess
+lowerStmt ctx role stmt k = case stmt of
 
   SNew n _ ->
     ProcessAction (New (mkSapicVar n)) mempty k
@@ -353,37 +417,66 @@ lowerStmt role stmt k = case stmt of
   SLet n e _ ->
     ProcessComb
       (Let { letLeft  = varTerm (mkSapicVar n)
-           , letRight = lowerExpr e
+           , letRight = lowerExpr ctx e
            , letMatch = Set.empty
            })
       mempty
       k                              -- "then" branch: n is in scope
       (ProcessNull mempty)           -- "else" branch: degenerate
 
-  SRequire _ _ ->
-    -- TODO[next]: emit a CondEq guard. Requires looking up
-    -- verify(...) in the active builtin signature.
-    k
+  SRequire e _ ->
+    -- Continue iff `e` evaluates to `true`. For the canonical
+    -- `require VERIFY(pk, body, sig)` form this becomes a CondEq
+    -- against the constant 'true', which Tamarin's equational
+    -- theory rewrites by the `verify(sign(...)) = true` rule when
+    -- the signature is honestly produced.
+    ProcessComb
+      (CondEq (lowerExpr ctx e) sapicTrue)
+      mempty
+      k
+      (ProcessNull mempty)
 
   SSend e _ -> case role of
-    RSender   -> ProcessAction (ChOut Nothing (lowerExpr e))               mempty k
+    RSender   -> ProcessAction (ChOut Nothing (lowerExpr ctx e))               mempty k
     -- Receiver side: prefix every variable name with `pat_` so that
     -- Sapic.applyM does not flag the receive as capturing a
     -- let-bound name from a parallel branch (see
     -- 'Theory.Sapic.Process.CapturedEx' for the diagnostic). Per
     -- Sapic's own error-message recommendation, the workaround is
     -- exactly this rename.
-    RReceiver -> ProcessAction (ChIn Nothing (lowerExprPat e) Set.empty)   mempty k
+    RReceiver -> ProcessAction (ChIn Nothing (lowerExprPat ctx e) Set.empty)   mempty k
     RLocalActor -> k                  -- local steps don't `send`; ignore
 
   SClaim (ClaimSecret n) _ ->
-    ProcessAction (Event (secretFact n)) mempty k
+    ProcessAction (Event (secretFact ctx n)) mempty k
+
+-- | The constant @true@ that Tamarin's equational theory uses on
+-- the right-hand side of @verify(sign(_,_), _, pk(_)) = true@.
+sapicTrue :: SapicNTerm SapicLVar
+sapicTrue = pubTerm "true"
 
 -- | Build a @Secret(<n>)@ event fact. Tamarin lemma templates from
 -- design step 2 §2.3.1 quantify over this fact name.
-secretFact :: T.Text -> SapicNFact SapicLVar
-secretFact n =
-  protoFact Linear "Secret" [varTerm (mkSapicVar n)]
+secretFact :: LowerCtx -> T.Text -> SapicNFact SapicLVar
+secretFact ctx n =
+  protoFact Linear "Secret" [resolveVar ctx n]
+
+-- | Resolve a Clementine identifier to a Sapic term according to
+-- the lowering context.
+resolveVar :: LowerCtx -> T.Text -> SapicNTerm SapicLVar
+resolveVar ctx n
+  | n `Set.member` lcPrincipalNames ctx = pubTerm (T.unpack n)
+  | n `Set.member` lcPublicParams   ctx = pubTerm (T.unpack n)
+  | n `Set.member` lcReceived ctx       = varTerm (mkPatVar n)
+  | otherwise                           = varTerm (mkSapicVar n)
+  where
+    mkPatVar nm = SapicLVar (LVar ("pat" ++ capitalize (T.unpack nm)) LSortFresh 0) Nothing
+    capitalize ""     = ""
+    capitalize (c:cs) = toUpper c : cs
+
+    toUpper c
+      | c >= 'a' && c <= 'z' = toEnum (fromEnum c - 32)
+      | otherwise            = c
 
 -- | Build a fresh-sorted Sapic variable from a Clementine identifier.
 mkSapicVar :: T.Text -> SapicLVar
@@ -408,15 +501,15 @@ mkSapicVar name =
 -- nsl fixtures.
 --------------------------------------------------------------------------------
 
-lowerExpr :: Expr -> SapicNTerm SapicLVar
-lowerExpr e = case e of
-  EVar n _       -> varTerm (mkSapicVar n)
+lowerExpr :: LowerCtx -> Expr -> SapicNTerm SapicLVar
+lowerExpr ctx e = case e of
+  EVar n _       -> resolveVar ctx n
   EConst c _     -> pubTerm (T.unpack c)
   ETup [] _      -> pubTerm "unit"      -- defensive; parser rejects
-  ETup [x] _     -> lowerExpr x
-  ETup xs _      -> foldr1Pair (map lowerExpr xs)
-  EApp op args _ -> lowerPrimApp op (map lowerExpr args)
-  EExp b x _     -> fAppExp (lowerExpr b, lowerExpr x)
+  ETup [x] _     -> lowerExpr ctx x
+  ETup xs _      -> foldr1Pair (map (lowerExpr ctx) xs)
+  EApp op args _ -> lowerPrimApp op (map (lowerExpr ctx) args)
+  EExp b x _     -> fAppExp (lowerExpr ctx b, lowerExpr ctx x)
   where
     foldr1Pair :: [SapicNTerm SapicLVar] -> SapicNTerm SapicLVar
     foldr1Pair []     = pubTerm "unit"
@@ -452,21 +545,28 @@ lowerPrimApp op args = case op of
 -- variable name (e.g. both A's @sigA@ binding and B's @sigA@
 -- receive of the same wire bytes) cause Sapic to throw
 -- 'Theory.Sapic.Process.CapturedEx CapturedIn'.
-lowerExprPat :: Expr -> SapicNTerm SapicLVar
-lowerExprPat e = case e of
-  EVar n _       -> varTerm (mkPatVar n)
+-- | Receive-side variant: every plain identifier becomes a Sapic
+-- pattern variable with the @pat@ prefix. Principal names still
+-- lower to public constants. The @ctx@ argument is unused for the
+-- variable handling itself but kept symmetric so call sites stay
+-- uniform.
+lowerExprPat :: LowerCtx -> Expr -> SapicNTerm SapicLVar
+lowerExprPat ctx e = case e of
+  EVar n _
+    | n `Set.member` lcPrincipalNames ctx -> pubTerm (T.unpack n)
+    | n `Set.member` lcPublicParams   ctx -> pubTerm (T.unpack n)
+    | otherwise                           -> varTerm (mkPatVar n)
   EConst c _     -> pubTerm (T.unpack c)
   ETup [] _      -> pubTerm "unit"
-  ETup [x] _     -> lowerExprPat x
-  ETup xs _      -> foldr1Pair (map lowerExprPat xs)
-  EApp op args _ -> lowerPrimApp op (map lowerExprPat args)
-  EExp b x _     -> fAppExp (lowerExprPat b, lowerExprPat x)
+  ETup [x] _     -> lowerExprPat ctx x
+  ETup xs _      -> foldr1Pair (map (lowerExprPat ctx) xs)
+  EApp op args _ -> lowerPrimApp op (map (lowerExprPat ctx) args)
+  EExp b x _     -> fAppExp (lowerExprPat ctx b, lowerExprPat ctx x)
   where
     foldr1Pair []     = pubTerm "unit"
     foldr1Pair [t]    = t
     foldr1Pair (t:ts) = fAppPair (t, foldr1Pair ts)
 
-    -- Sapic's required prefix for receive-side pattern variables.
     mkPatVar n = SapicLVar (LVar ("pat" ++ capitalize (T.unpack n)) LSortFresh 0) Nothing
     capitalize ""      = ""
     capitalize (c:cs)  = toUpper c : cs
