@@ -46,8 +46,7 @@ module Clementine.LowerSapic
   ) where
 
 import           Control.Monad         (foldM)
-import           Control.Monad.Catch   (MonadThrow)
-import           Data.Maybe            (fromMaybe)
+import           Control.Monad.Catch   (MonadThrow, MonadCatch)
 import qualified Data.Set              as Set
 import           Data.Text             (Text)
 import qualified Data.Text             as T
@@ -60,7 +59,6 @@ import           Theory.Sapic
                    , Process(..)
                    , SapicAction(..)
                    , ProcessCombinator(..)
-                   , LProcess
                    )
 -- tamarin-prover-sapic
 import qualified Sapic
@@ -86,9 +84,10 @@ data LowerError
 
 -- | Lower a Clementine 'Protocol' to a fully translated
 -- 'Theory.OpenTheory'. Pure up to the 'Sapic.translate' call, which
--- runs in a 'MonadThrow' so we propagate Sapic exceptions.
+-- runs in 'MonadThrow' / 'MonadCatch' to propagate Sapic exceptions
+-- from its many internal phases.
 lowerProtocolSapic
-  :: MonadThrow m
+  :: (MonadThrow m, MonadCatch m)
   => Protocol
   -> m OpenTheory
 lowerProtocolSapic p = do
@@ -110,11 +109,14 @@ addLemmaOrFail
   :: MonadThrow m => OpenTheory -> Th.Lemma Th.ProofSkeleton -> m OpenTheory
 addLemmaOrFail th l = case Th.addLemma l th of
   Just th' -> pure th'
-  Nothing  -> errorM ("duplicate lemma name: " ++ T.unpack (Th.lName l))
-  where
-    -- TODO[verify]: pick the appropriate Sapic exception or wrap in
-    -- our own ClementineError once this is wired through Clementine.hs.
-    errorM = error  -- placeholder; replace with throwM of a proper exn
+  -- TODO[verify]: wrap as ClementineError once routed through
+  -- Clementine.hs; for now we fail loudly so the bug is obvious.
+  -- The lemma name is an fclabels lens not a plain accessor, so
+  -- printing it requires `get lName l`; deferred until we wire the
+  -- Extension.Data.Label import.
+  Nothing  -> error "Clementine.LowerSapic.addLemmaOrFail: \
+                    \duplicate lemma name (TODO[verify]: format with \
+                    \Extension.Data.Label.get and Th.lName)"
 
 --------------------------------------------------------------------------------
 -- AST -> Sapic.PlainProcess

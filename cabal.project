@@ -1,0 +1,38 @@
+-- Workspace project for the Clementine sub-library only.
+--
+-- This file deliberately does NOT include the top-level
+-- `tamarin-prover` executable package, because that pulls in
+-- yesod-core / yesod-static / hashable transitively, and the
+-- versions pinned by `lts-22.44` (the resolver in stack.yaml) are
+-- incompatible with the system GHC for unrelated reasons.
+--
+-- Clementine only needs the *library* layers underneath it:
+-- utils, term, theory, sapic.
+packages:
+  lib/clementine/
+  lib/sapic/
+  lib/theory/
+  lib/term/
+  lib/utils/
+  third-party/fclabels/
+
+-- The workspace's transitive deps were last bumped against an
+-- older containers/text/base. Modern GHCs ship newer versions; we
+-- relax the affected upper bounds rather than vendor or pin a
+-- second GHC.
+-- Wildcard relaxation: every transitive dependency has cabal upper
+-- bounds that pre-date GHC 9.14. We accept the risk of API drift on
+-- a case-by-case basis (the build either compiles or it doesn't, and
+-- the workspace is small enough that we'll see breakage immediately).
+allow-newer: all:base, all:template-haskell, all:ghc-prim, all:containers,
+             all:bytestring, all:text, all:transformers, all:time,
+             all:directory, all:deepseq, all:filepath, all:mtl,
+             all:array, all:stm, all:process, all:binary, all:pretty,
+             all:unix, all:Cabal
+
+-- Force modern versions of packages whose old releases reference
+-- modules that newer transformers/ghc dropped.
+constraints:
+  mmorph   >= 1.2,
+  fgl      >= 5.8,
+  graphviz >= 2999.20.2,
