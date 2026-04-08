@@ -38,15 +38,40 @@ module Clementine.LowerSapic
   , LowerError(..)
   ) where
 
+-- We need 'Control.Category.(.)' (lens composition) instead of the
+-- Prelude's function composition operator. fclabels lenses are
+-- categories.
+import           Prelude               hiding (id, (.))
+import           Control.Category      ((.))
+
 import           Control.Monad         (foldM)
 import           Control.Monad.Catch   (MonadThrow, MonadCatch)
 import           Data.Maybe            (mapMaybe)
 import qualified Data.Set              as Set
 import qualified Data.Text             as T
 
+-- tamarin-prover-utils
+import           Extension.Data.Label  (get, set)
+
 -- tamarin-prover-term
-import           Term.LTerm            (LVar(..), LSort(..), pubTerm)
+--
+-- Note: 'fAppNoEq', 'fAppPair', 'fAppExp' all live in 'Term.Term'
+-- which is an @other-modules@ of @tamarin-prover-term@. We reach
+-- them via 'Term.LTerm' → 'Term.VTerm' → 'Term.Term' (the latter
+-- is re-exported through @module Term.Term@ in @VTerm.hs@ and
+-- @LTerm.hs@).
+import           Term.LTerm            ( LVar(..), LSort(..)
+                                       , pubTerm
+                                       , fAppNoEq, fAppPair, fAppExp )
 import           Term.VTerm            (varTerm)
+import           Term.Builtin.Signature
+                                       ( aencSym, signSym, hashSym
+                                       , verifySym, pkSym, sencSym )
+import           Term.Maude.Signature  ( MaudeSig
+                                       , dhMaudeSig, asymEncMaudeSig
+                                       , symEncMaudeSig
+                                       , signatureMaudeSig
+                                       , hashMaudeSig )
 
 -- tamarin-prover-theory
 import           Theory.Model.Fact     (protoFact, Multiplicity(..))
@@ -56,6 +81,8 @@ import qualified Theory                as Th
 import           Theory                ( OpenTheory, defaultOpenTheory
                                        , prettyOpenTranslatedTheory
                                        , removeTranslationItems
+                                       , thySignature
+                                       , sigpMaudeSig
                                        , TraceQuantifier(..) )
 import           Theory.ProofSkeleton  (unprovenLemma)
 import           Theory.Model.Formula  (ltrue, LNFormula)
@@ -98,14 +125,40 @@ lowerProtocolSapic
   => Protocol
   -> m OpenTheory
 lowerProtocolSapic p = do
-  let th0 = defaultOpenTheory False
-      -- One Sapic process for the whole protocol; principals are
-      -- composed in parallel under top-level replication.
+  -- Start from an empty theory, then mappend in the Maude
+  -- signatures for every builtin the source mentions. This is what
+  -- enables `^`, `aenc`, `sign`, `verify`, `pk`, `h`, `senc`, etc.
+  -- in the rule body terms.
+  let th0  = installBuiltins (protoBuiltins p) (defaultOpenTheory False)
       proc = lowerProtocolToProcess p
       th1  = Th.addProcess proc th0
   th2 <- foldM addLemmaOrFail th1
                    (concatMap (lowerQuery th1 p) (protoVerify p))
   Sapic.translate th2
+
+-- | Mappend the Maude signatures for each Clementine builtin into
+-- the theory's signature lens, replicating what the @builtins:@
+-- declaration in a hand-written .spthy does. This is what makes
+-- @^@, @aenc@, @sign@, @verify@, @pk@, @h@, @senc@ available as
+-- function symbols in subsequent terms.
+installBuiltins :: [Builtin] -> OpenTheory -> OpenTheory
+installBuiltins bs th =
+  let -- fclabels lens composition: set (sigpMaudeSig . thySignature)
+      -- accesses the MaudeSig nested inside the SignaturePure inside
+      -- the Theory. This is the same pattern as in
+      -- Theory.Text.Parser.hs:251.
+      lens       = sigpMaudeSig . thySignature
+      currentSig = get lens th
+      newSig     = foldr mappend currentSig (map builtinMaudeSig bs)
+  in  set lens newSig th
+
+builtinMaudeSig :: Builtin -> MaudeSig
+builtinMaudeSig b = case b of
+  BIDH      -> dhMaudeSig
+  BISigning -> signatureMaudeSig
+  BIHashing -> hashMaudeSig
+  BISymEnc  -> symEncMaudeSig
+  BIAsymEnc -> asymEncMaudeSig
 
 -- | Convenience: lower, run Sapic translation, drop the source
 -- 'Theory.Sapic.PlainProcess' (so the resulting spthy contains the
@@ -339,34 +392,54 @@ mkSapicVar name =
 --------------------------------------------------------------------------------
 -- AST Expr -> Sapic term
 --
--- v0.1 coverage:
+-- v0.2 coverage (this commit):
 --   * EVar    -> varTerm of a fresh-sorted Sapic variable
 --   * EConst  -> pubTerm of the literal name
---   * ETup    -> opaque variable (TODO[next]: pair constructor
---                lives in Term.Term which is `other-modules`;
---                switch to fAppNoEq pairSym once we expose it
---                upstream or vendor a re-export)
---   * EApp    -> opaque variable (TODO[next]: function-symbol lookup
---                from active builtin signature)
---   * EExp    -> opaque variable (TODO[next]: same; DH needs the
---                diffie-hellman builtin's exponentiation symbol)
+--   * ETup    -> right-folded pair: <a, b, c> = pair(a, pair(b, c))
+--   * EApp    -> real function-symbol applications, dispatched on
+--                the PrimOp tag (AENC -> aencSym, SIGN -> signSym,
+--                VERIFY -> verifySym, PK -> pkSym, H -> hashSym,
+--                ENC -> sencSym, ...)
+--   * EExp    -> diffie-hellman expSym
 --
--- The opaque-variable fallback is sound but uninformative: every
--- application of an unhandled primitive collapses to the same
--- placeholder, so e.g. SIGN(skA, m1) and SIGN(skA, m2) become the
--- same term in the lowered theory. This makes some lemmas vacuous
--- in the meantime; the workaround for v0.1 is to test against
--- protocols whose secrecy claims target plain `new` variables, not
--- derived terms. The full lowering arrives in the next commit.
+-- The PrimOps that are not yet wired (DEC/ADEC/MAC/AEAD) still
+-- collapse to opaque variables; they are unused in the iso_dh and
+-- nsl fixtures.
 --------------------------------------------------------------------------------
 
 lowerExpr :: Expr -> SapicNTerm SapicLVar
 lowerExpr e = case e of
-  EVar n _      -> varTerm (mkSapicVar n)
-  EConst c _    -> pubTerm (T.unpack c)
-  ETup _ _      -> varTerm (mkSapicVar (T.pack "opaqueTup"))
-  EApp _ _ _    -> varTerm (mkSapicVar (T.pack "opaqueApp"))
-  EExp _ _ _    -> varTerm (mkSapicVar (T.pack "opaqueExp"))
+  EVar n _       -> varTerm (mkSapicVar n)
+  EConst c _     -> pubTerm (T.unpack c)
+  ETup [] _      -> pubTerm "unit"      -- defensive; parser rejects
+  ETup [x] _     -> lowerExpr x
+  ETup xs _      -> foldr1Pair (map lowerExpr xs)
+  EApp op args _ -> lowerPrimApp op (map lowerExpr args)
+  EExp b x _     -> fAppExp (lowerExpr b, lowerExpr x)
+  where
+    foldr1Pair :: [SapicNTerm SapicLVar] -> SapicNTerm SapicLVar
+    foldr1Pair []     = pubTerm "unit"
+    foldr1Pair [t]    = t
+    foldr1Pair (t:ts) = fAppPair (t, foldr1Pair ts)
+
+-- | Map a Clementine 'PrimOp' to its corresponding Tamarin function
+-- symbol. Operators that we have not yet wired (DEC, ADEC, MAC) fall
+-- through to an opaque variable so the rule still type-checks; they
+-- are unused in the v0.2 fixture set.
+lowerPrimApp :: PrimOp -> [SapicNTerm SapicLVar] -> SapicNTerm SapicLVar
+lowerPrimApp op args = case op of
+  OpAEnc   -> fAppNoEq aencSym   args
+  OpEnc    -> fAppNoEq sencSym   args
+  OpSign   -> fAppNoEq signSym   args
+  OpVerify -> fAppNoEq verifySym args
+  OpPK     -> fAppNoEq pkSym     args
+  OpH      -> fAppNoEq hashSym   args
+  -- Not yet wired:
+  OpDec    -> opaque "opaqueDec"
+  OpADec   -> opaque "opaqueAdec"
+  OpMAC    -> opaque "opaqueMac"
+  where
+    opaque n = varTerm (mkSapicVar (T.pack n))
 
 -- | Pattern-side variant of 'lowerExpr', for receive sites.
 --
@@ -380,16 +453,19 @@ lowerExpr e = case e of
 -- 'Theory.Sapic.Process.CapturedEx CapturedIn'.
 lowerExprPat :: Expr -> SapicNTerm SapicLVar
 lowerExprPat e = case e of
-  EVar n _      -> varTerm (mkPatVar n)
-  EConst c _    -> pubTerm (T.unpack c)
-  ETup _ _      -> varTerm (mkPatVar (T.pack "opaqueTup"))
-  EApp _ _ _    -> varTerm (mkPatVar (T.pack "opaqueApp"))
-  EExp _ _ _    -> varTerm (mkPatVar (T.pack "opaqueExp"))
+  EVar n _       -> varTerm (mkPatVar n)
+  EConst c _     -> pubTerm (T.unpack c)
+  ETup [] _      -> pubTerm "unit"
+  ETup [x] _     -> lowerExprPat x
+  ETup xs _      -> foldr1Pair (map lowerExprPat xs)
+  EApp op args _ -> lowerPrimApp op (map lowerExprPat args)
+  EExp b x _     -> fAppExp (lowerExprPat b, lowerExprPat x)
   where
+    foldr1Pair []     = pubTerm "unit"
+    foldr1Pair [t]    = t
+    foldr1Pair (t:ts) = fAppPair (t, foldr1Pair ts)
+
     -- Sapic's required prefix for receive-side pattern variables.
-    -- Tamarin's identifier grammar wants names that begin with a
-    -- letter, so we keep "pat" (no underscore) followed by the
-    -- original Clementine identifier.
     mkPatVar n = SapicLVar (LVar ("pat" ++ capitalize (T.unpack n)) LSortFresh 0) Nothing
     capitalize ""      = ""
     capitalize (c:cs)  = toUpper c : cs
