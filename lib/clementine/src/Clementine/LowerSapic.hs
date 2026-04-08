@@ -40,10 +40,16 @@ module Clementine.LowerSapic
 
 import           Control.Monad         (foldM)
 import           Control.Monad.Catch   (MonadThrow, MonadCatch)
+import           Data.Maybe            (mapMaybe)
+import qualified Data.Set              as Set
 import qualified Data.Text             as T
 
 -- tamarin-prover-term
-import           Term.LTerm            (LVar(..), LSort(..))
+import           Term.LTerm            (LVar(..), LSort(..), pubTerm)
+import           Term.VTerm            (varTerm)
+
+-- tamarin-prover-theory
+import           Theory.Model.Fact     (protoFact, Multiplicity(..))
 
 -- tamarin-prover-theory
 import qualified Theory                as Th
@@ -59,6 +65,8 @@ import           Theory.Sapic          ( PlainProcess
                                        , SapicAction(..)
                                        , ProcessCombinator(..)
                                        , SapicLVar(..)
+                                       , SapicNTerm
+                                       , SapicNFact
                                        )
 import           Text.PrettyPrint.Class (Doc, render)
 
@@ -198,10 +206,12 @@ compatibilityCleanup = unlines . go . lines
 --------------------------------------------------------------------------------
 
 lowerProtocolToProcess :: Protocol -> PlainProcess
-lowerProtocolToProcess p = parallelOf (map lowerPrincipal (protoPrincipals p))
+lowerProtocolToProcess = lowerProtocolToProcess'
+
+lowerProtocolToProcess' :: Protocol -> PlainProcess
+lowerProtocolToProcess' p = parallelOf
+  [ lowerPrincipal (protoSteps p) prin | prin <- protoPrincipals p ]
   where
-    -- Balance the parallel tree to avoid quadratic proof shape on
-    -- protocols with many principals.
     parallelOf :: [PlainProcess] -> PlainProcess
     parallelOf []  = ProcessNull mempty
     parallelOf [x] = x
@@ -209,24 +219,184 @@ lowerProtocolToProcess p = parallelOf (map lowerPrincipal (protoPrincipals p))
       let (l, r) = splitAt (length xs `div` 2) xs
       in  ProcessComb Parallel mempty (parallelOf l) (parallelOf r)
 
--- | Lower one principal to `! new ~ltk1; new ~ltk2; ...; 0`.
-lowerPrincipal :: Principal -> PlainProcess
-lowerPrincipal pr =
+-- | Lower one principal: long-term key freshes, then the sequence
+-- of step actions belonging to this principal (as sender, receiver,
+-- or local actor), all wrapped in top-level replication.
+lowerPrincipal :: [Step] -> Principal -> PlainProcess
+lowerPrincipal allSteps pr =
     ProcessAction Rep mempty
-      $ withFreshKeys
-          [n | KGenerates n _ <- prinKnows pr]
-          (ProcessNull mempty)
+      $ withFreshKeys [n | KGenerates n _ <- prinKnows pr]
+      $ stepSequence (relevantSteps (prinName pr) allSteps)
+      $ ProcessNull mempty
   where
     withFreshKeys []     k = k
     withFreshKeys (n:ns) k =
       ProcessAction (New (mkSapicVar n)) mempty (withFreshKeys ns k)
 
+-- | The role this principal plays in a given step.
+data StepRole = RSender | RReceiver | RLocalActor
+
+-- | Steps that this principal participates in, in declaration order,
+-- tagged with the role the principal plays.
+relevantSteps :: T.Text -> [Step] -> [(Step, StepRole)]
+relevantSteps p = mapMaybe pick
+  where
+    pick s
+      | stepFrom s == p = case stepKind s of
+          StepLocal       -> Just (s, RLocalActor)
+          StepNetwork _ _ -> Just (s, RSender)
+      | otherwise = case stepKind s of
+          StepNetwork tgt _ | tgt == p -> Just (s, RReceiver)
+          _                            -> Nothing
+
+stepSequence :: [(Step, StepRole)] -> PlainProcess -> PlainProcess
+stepSequence []           k = k
+stepSequence ((s,r):rest) k = lowerStep s r (stepSequence rest k)
+
+-- | Lower one step from one principal's perspective.
+--
+--   * Sender: run every statement in the step body in declaration
+--     order. The 'SSend' becomes an 'out(c, e)' action.
+--   * Receiver: run /only/ a single 'in(c, e)' action for the
+--     'SSend' statement in the body. The other statements are
+--     sender-side computation (fresh nonces, let-bindings,
+--     requires, claims) and do not happen on the receiver. This is
+--     the standard message-passing semantics from design step 2.
+--   * Local actor: same as sender but no 'out'.
+lowerStep :: Step -> StepRole -> PlainProcess -> PlainProcess
+lowerStep s role = case role of
+  RSender     -> foldSenderStmts (stepBody s)
+  RLocalActor -> foldSenderStmts (stepBody s)
+  RReceiver   -> emitReceive (stepBody s)
+  where
+    foldSenderStmts []     k = k
+    foldSenderStmts (x:xs) k = lowerStmt role x (foldSenderStmts xs k)
+
+    -- The receiver only consumes the wire message. We find the
+    -- (single) 'SSend' in the body and emit a 'ChIn' for it. If
+    -- there is no SSend (a `local` step accidentally tagged as
+    -- network) we emit nothing.
+    emitReceive body k = case [e | SSend e _ <- body] of
+      []      -> k
+      (e : _) ->
+        ProcessAction
+          (ChIn Nothing (lowerExprPat e) Set.empty)
+          mempty
+          k
+
+-- | Lower a single statement of a step body.
+--
+-- v0.1 implementation: handles 'SNew', 'SLet', 'SSend', 'SClaim'.
+-- 'SRequire' is currently a no-op — the receiver-side equality
+-- check it should emit needs the verify(...) function symbol from
+-- the active builtin signature, which is the next iteration.
+lowerStmt :: StepRole -> StepStmt -> PlainProcess -> PlainProcess
+lowerStmt role stmt k = case stmt of
+
+  SNew n _ ->
+    ProcessAction (New (mkSapicVar n)) mempty k
+
+  SLet n e _ ->
+    ProcessComb
+      (Let { letLeft  = varTerm (mkSapicVar n)
+           , letRight = lowerExpr e
+           , letMatch = Set.empty
+           })
+      mempty
+      k                              -- "then" branch: n is in scope
+      (ProcessNull mempty)           -- "else" branch: degenerate
+
+  SRequire _ _ ->
+    -- TODO[next]: emit a CondEq guard. Requires looking up
+    -- verify(...) in the active builtin signature.
+    k
+
+  SSend e _ -> case role of
+    RSender   -> ProcessAction (ChOut Nothing (lowerExpr e))               mempty k
+    -- Receiver side: prefix every variable name with `pat_` so that
+    -- Sapic.applyM does not flag the receive as capturing a
+    -- let-bound name from a parallel branch (see
+    -- 'Theory.Sapic.Process.CapturedEx' for the diagnostic). Per
+    -- Sapic's own error-message recommendation, the workaround is
+    -- exactly this rename.
+    RReceiver -> ProcessAction (ChIn Nothing (lowerExprPat e) Set.empty)   mempty k
+    RLocalActor -> k                  -- local steps don't `send`; ignore
+
+  SClaim (ClaimSecret n) _ ->
+    ProcessAction (Event (secretFact n)) mempty k
+
+-- | Build a @Secret(<n>)@ event fact. Tamarin lemma templates from
+-- design step 2 §2.3.1 quantify over this fact name.
+secretFact :: T.Text -> SapicNFact SapicLVar
+secretFact n =
+  protoFact Linear "Secret" [varTerm (mkSapicVar n)]
+
 -- | Build a fresh-sorted Sapic variable from a Clementine identifier.
--- We pick LSortFresh because every Clementine `generates` corresponds
--- to a Tamarin Fr() premise.
 mkSapicVar :: T.Text -> SapicLVar
 mkSapicVar name =
   SapicLVar (LVar (T.unpack name) LSortFresh 0) Nothing
+
+--------------------------------------------------------------------------------
+-- AST Expr -> Sapic term
+--
+-- v0.1 coverage:
+--   * EVar    -> varTerm of a fresh-sorted Sapic variable
+--   * EConst  -> pubTerm of the literal name
+--   * ETup    -> opaque variable (TODO[next]: pair constructor
+--                lives in Term.Term which is `other-modules`;
+--                switch to fAppNoEq pairSym once we expose it
+--                upstream or vendor a re-export)
+--   * EApp    -> opaque variable (TODO[next]: function-symbol lookup
+--                from active builtin signature)
+--   * EExp    -> opaque variable (TODO[next]: same; DH needs the
+--                diffie-hellman builtin's exponentiation symbol)
+--
+-- The opaque-variable fallback is sound but uninformative: every
+-- application of an unhandled primitive collapses to the same
+-- placeholder, so e.g. SIGN(skA, m1) and SIGN(skA, m2) become the
+-- same term in the lowered theory. This makes some lemmas vacuous
+-- in the meantime; the workaround for v0.1 is to test against
+-- protocols whose secrecy claims target plain `new` variables, not
+-- derived terms. The full lowering arrives in the next commit.
+--------------------------------------------------------------------------------
+
+lowerExpr :: Expr -> SapicNTerm SapicLVar
+lowerExpr e = case e of
+  EVar n _      -> varTerm (mkSapicVar n)
+  EConst c _    -> pubTerm (T.unpack c)
+  ETup _ _      -> varTerm (mkSapicVar (T.pack "opaqueTup"))
+  EApp _ _ _    -> varTerm (mkSapicVar (T.pack "opaqueApp"))
+  EExp _ _ _    -> varTerm (mkSapicVar (T.pack "opaqueExp"))
+
+-- | Pattern-side variant of 'lowerExpr', for receive sites.
+--
+-- Same as 'lowerExpr' except every Clementine identifier becomes
+-- a Sapic variable named @pat_<n>@. Sapic's bindings analysis uses
+-- the @pat_@ prefix as the convention for "this is a pattern
+-- introduced by an input, not a capture from outer scope". Without
+-- this rename, parallel principals that happen to use the same
+-- variable name (e.g. both A's @sigA@ binding and B's @sigA@
+-- receive of the same wire bytes) cause Sapic to throw
+-- 'Theory.Sapic.Process.CapturedEx CapturedIn'.
+lowerExprPat :: Expr -> SapicNTerm SapicLVar
+lowerExprPat e = case e of
+  EVar n _      -> varTerm (mkPatVar n)
+  EConst c _    -> pubTerm (T.unpack c)
+  ETup _ _      -> varTerm (mkPatVar (T.pack "opaqueTup"))
+  EApp _ _ _    -> varTerm (mkPatVar (T.pack "opaqueApp"))
+  EExp _ _ _    -> varTerm (mkPatVar (T.pack "opaqueExp"))
+  where
+    -- Sapic's required prefix for receive-side pattern variables.
+    -- Tamarin's identifier grammar wants names that begin with a
+    -- letter, so we keep "pat" (no underscore) followed by the
+    -- original Clementine identifier.
+    mkPatVar n = SapicLVar (LVar ("pat" ++ capitalize (T.unpack n)) LSortFresh 0) Nothing
+    capitalize ""      = ""
+    capitalize (c:cs)  = toUpper c : cs
+
+    toUpper c
+      | c >= 'a' && c <= 'z' = toEnum (fromEnum c - 32)
+      | otherwise            = c
 
 --------------------------------------------------------------------------------
 -- Lemma generation
