@@ -86,6 +86,8 @@ import           Theory                ( OpenTheory, defaultOpenTheory
                                        , thySignature
                                        , sigpMaudeSig )
 import           Theory.Text.Parser    (parseLemmaWithMacros)
+
+import           Clementine.Sources    (makeAutoSourcesLemma)
 import           Theory.Sapic          ( PlainProcess
                                        , Process(..)
                                        , SapicAction(..)
@@ -134,9 +136,24 @@ lowerProtocolSapic p = do
            $ defaultOpenTheory False
       proc = lowerProtocolToProcess p
       th1  = Th.addProcess proc th0
+
+  -- Verify-block lemmas, in declaration order.
   th2 <- foldM addLemmaOrFail th1
                    (concatMap (lowerQuery th1 p) (protoVerify p))
-  Sapic.translate th2
+
+  -- Sources lemma (design step §5). 'makeAutoSourcesLemma' returns
+  -- 'Nothing' when no open chains are detected, in which case the
+  -- theory is unchanged.
+  th3 <- case makeAutoSourcesLemma p of
+           Nothing  -> pure th2
+           Just src -> case parseLemmaWithMacros th2 src of
+             Left e  -> error
+                          ("Clementine.LowerSapic: internal: \
+                           \auto_sources lemma failed to parse: "
+                           ++ show e)
+             Right l -> addLemmaOrFail th2 l
+
+  Sapic.translate th3
 
 -- | Mappend the Maude signatures for each Clementine builtin into
 -- the theory's signature lens, replicating what the @builtins:@
@@ -704,6 +721,14 @@ lowerExpr ctx e = case e of
   ETup [x] _     -> lowerExpr ctx x
   ETup xs _      -> foldr1Pair (map (lowerExpr ctx) xs)
   EApp op args _ -> lowerPrimApp op (map (lowerExpr ctx) args)
+  -- Special case: a literal DH share `'<base>'^<exp>` whose
+  -- exponent was received from a peer collapses to a single
+  -- canonical Sapic variable. The full term `(g^x)^y` parses
+  -- left-associatively, so the inner `g^x` matches this rule and
+  -- the outer fAppExp picks up the local `y`.
+  EExp (EConst b _) (EVar n _) _
+    | n `Set.member` lcReceived ctx ->
+        varTerm (mkDHPatVar b n)
   EExp b x _     -> fAppExp (lowerExpr ctx b, lowerExpr ctx x)
   where
     foldr1Pair :: [SapicNTerm SapicLVar] -> SapicNTerm SapicLVar
@@ -741,10 +766,13 @@ lowerPrimApp op args = case op of
 -- receive of the same wire bytes) cause Sapic to throw
 -- 'Theory.Sapic.Process.CapturedEx CapturedIn'.
 -- | Receive-side variant: every plain identifier becomes a Sapic
--- pattern variable with the @pat@ prefix. Principal names still
--- lower to public constants. The @ctx@ argument is unused for the
--- variable handling itself but kept symmetric so call sites stay
--- uniform.
+-- pattern variable with the @pat@ prefix. Principal names and
+-- public params still lower to public constants. DH shares
+-- @'<base>'^<var>@ collapse to a single canonical pat-variable so
+-- they appear as a single term on the wire (avoiding the
+-- multiplication-restriction warning that comes from trying to
+-- pattern-match on @'g'^~patX@, since DH is not a destructor in
+-- Tamarin's equational theory).
 lowerExprPat :: LowerCtx -> Expr -> SapicNTerm SapicLVar
 lowerExprPat ctx e = case e of
   EVar n _
@@ -756,6 +784,8 @@ lowerExprPat ctx e = case e of
   ETup [x] _     -> lowerExprPat ctx x
   ETup xs _      -> foldr1Pair (map (lowerExprPat ctx) xs)
   EApp op args _ -> lowerPrimApp op (map (lowerExprPat ctx) args)
+  -- DH-share special case: `'g'^x` becomes a single pat variable.
+  EExp (EConst b _) (EVar n _) _ -> varTerm (mkDHPatVar b n)
   EExp b x _     -> fAppExp (lowerExprPat ctx b, lowerExprPat ctx x)
   where
     foldr1Pair []     = pubTerm "unit"
@@ -766,6 +796,23 @@ lowerExprPat ctx e = case e of
     capitalize ""      = ""
     capitalize (c:cs)  = toUpper c : cs
 
+    toUpper c
+      | c >= 'a' && c <= 'z' = toEnum (fromEnum c - 32)
+      | otherwise            = c
+
+-- | Canonical Sapic variable for a received DH share @'<base>'^<exp>@.
+-- The same function is used at the wire receive site and at any
+-- subsequent body reference, so the two stay in sync without an
+-- explicit map.
+mkDHPatVar :: T.Text -> T.Text -> SapicLVar
+mkDHPatVar base expvar =
+  SapicLVar
+    (LVar ("patDh" ++ capitalize (T.unpack base) ++ capitalize (T.unpack expvar))
+          LSortFresh 0)
+    Nothing
+  where
+    capitalize ""     = ""
+    capitalize (c:cs) = toUpper c : cs
     toUpper c
       | c >= 'a' && c <= 'z' = toEnum (fromEnum c - 32)
       | otherwise            = c

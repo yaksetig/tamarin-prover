@@ -73,6 +73,7 @@ library
       , Clementine.Lower
       , Clementine.Errors
       , Clementine.SourceMap
+      , Clementine.Sources
 
     if flag(with-sapic)
         cpp-options: -DWITH_SAPIC

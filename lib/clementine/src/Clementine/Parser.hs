@@ -304,14 +304,15 @@ stepStmtP = (choice
 exprP :: Parser Expr
 exprP = expExprP
 
+-- DH exponentiation @^@ is /left/ associative: @'g'^x ^ y@ parses
+-- as @(('g'^x)^y)@, which by DH equational theory equals @g^(x*y)@
+-- and lets the lowering pass recognise the inner @'g'^x@ as a
+-- received DH share.
 expExprP :: Parser Expr
 expExprP = do
-  pos <- mkPos
-  base <- atomP
-  rest <- optionMaybe (symbol "^" *> expExprP)
-  pure $ case rest of
-    Nothing -> base
-    Just e2 -> EExp base e2 pos
+  pos    <- mkPos
+  parts  <- atomP `sepBy1` symbol "^"
+  pure (foldl1 (\a b -> EExp a b pos) parts)
 
 atomP :: Parser Expr
 atomP = choice
