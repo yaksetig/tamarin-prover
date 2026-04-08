@@ -42,10 +42,11 @@ module Clementine.LowerSapic
 -- Prelude's function composition operator. fclabels lenses are
 -- categories.
 import           Prelude               hiding (id, (.))
-import           Control.Category      ((.))
+import           Control.Category      (id, (.))
 
 import           Control.Monad         (foldM)
 import           Control.Monad.Catch   (MonadThrow, MonadCatch)
+import qualified Data.Map.Strict       as M
 import           Data.Maybe            (mapMaybe)
 import qualified Data.Set              as Set
 import qualified Data.Text             as T
@@ -264,11 +265,12 @@ lowerProtocolToProcess = lowerProtocolToProcess'
 
 lowerProtocolToProcess' :: Protocol -> PlainProcess
 lowerProtocolToProcess' p = parallelOf
-  [ lowerPrincipal principalNames (protoSteps p) prin
+  [ lowerPrincipal principalNames placements (protoSteps p) prin
   | prin <- protoPrincipals p
   ]
   where
     principalNames = map prinName (protoPrincipals p)
+    placements     = computeAgreementPlacements p
 
     parallelOf :: [PlainProcess] -> PlainProcess
     parallelOf []  = ProcessNull mempty
@@ -277,26 +279,108 @@ lowerProtocolToProcess' p = parallelOf
       let (l, r) = splitAt (length xs `div` 2) xs
       in  ProcessComb Parallel mempty (parallelOf l) (parallelOf r)
 
--- | Lower one principal: long-term key freshes, then the sequence
--- of step actions belonging to this principal (as sender, receiver,
--- or local actor), all wrapped in top-level replication.
-lowerPrincipal :: [T.Text] -> [Step] -> Principal -> PlainProcess
-lowerPrincipal principalNames allSteps pr =
+-- | Compute, for every verify-block agreement query, where the
+-- corresponding 'Running'/'Commit' events should be emitted in the
+-- lowered process.
+--
+-- Placement rule (a simplified form of Clementine design step 3
+-- §3.2):
+--
+--   * 'Commit' on the initiator @i@'s side at the LAST step in
+--     which @i@ participates.
+--
+--   * 'Running' on the responder @r@'s side at the FIRST step in
+--     which @r@ participates.
+--
+-- The result is a map from (principal name, step label) to the
+-- list of events that should be appended to that step's process.
+computeAgreementPlacements
+  :: Protocol -> M.Map (T.Text, T.Text) [AgreementEvent]
+computeAgreementPlacements p =
+  M.fromListWith (++) (concatMap forQuery (protoVerify p))
+  where
+    forQuery :: Query -> [((T.Text, T.Text), [AgreementEvent])]
+    forQuery q = case q of
+      QInjAgreement     i r _ _ -> placeAgreement i r
+      QNonInjAgreement  i r _ _ -> placeAgreement i r
+      QAuthentication   i r _   -> placeAgreement i r
+      _                         -> []
+
+    placeAgreement :: T.Text -> T.Text -> [((T.Text, T.Text), [AgreementEvent])]
+    placeAgreement i r =
+      let mLast  = lastStepOnSide  i
+          mFirst = firstStepOnSide r
+      in  catMaybesPair
+            [ fmap (\s -> ((i, stepLabel s), [AgreeCommit  i r])) mLast
+            , fmap (\s -> ((r, stepLabel s), [AgreeRunning r i])) mFirst
+            ]
+
+    -- A principal participates in a step if it is the source, the
+    -- target of a network arrow, or the local actor.
+    involves :: T.Text -> Step -> Bool
+    involves n s = stepFrom s == n || case stepKind s of
+      StepNetwork tgt _ -> tgt == n
+      _                 -> False
+
+    lastStepOnSide :: T.Text -> Maybe Step
+    lastStepOnSide n = case filter (involves n) (protoSteps p) of
+      [] -> Nothing
+      ss -> Just (last ss)
+
+    firstStepOnSide :: T.Text -> Maybe Step
+    firstStepOnSide n = case filter (involves n) (protoSteps p) of
+      []     -> Nothing
+      (s:_)  -> Just s
+
+    catMaybesPair :: [Maybe a] -> [a]
+    catMaybesPair = mapMaybe id
+
+-- | Lower one principal: long-term key freshes (each followed by
+-- a 'KeyGen' event so aliveness lemmas can quantify over them),
+-- then the sequence of step actions belonging to this principal
+-- (as sender, receiver, or local actor), all wrapped in top-level
+-- replication.
+lowerPrincipal
+  :: [T.Text]
+  -> M.Map (T.Text, T.Text) [AgreementEvent]
+  -> [Step]
+  -> Principal
+  -> PlainProcess
+lowerPrincipal principalNames placements allSteps pr =
     ProcessAction Rep mempty
-      $ withFreshKeys [n | KGenerates n _ <- prinKnows pr]
+      $ withFreshKeysAndKeyGen [n | KGenerates n _ <- prinKnows pr]
       $ stepSequence ctx0 (relevantSteps (prinName pr) allSteps)
       $ ProcessNull mempty
   where
-    withFreshKeys []     k = k
-    withFreshKeys (n:ns) k =
-      ProcessAction (New (mkSapicVar n)) mempty (withFreshKeys ns k)
+    -- For each long-term key, emit `new ~k` immediately followed by
+    -- `event KeyGen(<principal>, ~k)`. The KeyGen action fact is
+    -- what design step 2 §2.3.5 (Lowe aliveness) quantifies over.
+    withFreshKeysAndKeyGen []     k = k
+    withFreshKeysAndKeyGen (n:ns) k =
+      let v = mkSapicVar n
+          rest = withFreshKeysAndKeyGen ns k
+          keyGenEvt = ProcessAction
+                        (Event (keyGenFact (prinName pr) n))
+                        mempty
+                        rest
+      in  ProcessAction (New v) mempty keyGenEvt
 
     ctx0 = LowerCtx
-      { lcReceived       = Set.empty
-      , lcPrincipalNames = Set.fromList principalNames
-      , lcPublicParams   = Set.fromList
+      { lcReceived         = Set.empty
+      , lcPrincipalNames   = Set.fromList principalNames
+      , lcPublicParams     = Set.fromList
           [n | KKnowsPublic n _ _ <- prinKnows pr]
+      , lcCurrentPrincipal = prinName pr
+      , lcAgreementMap     = placements
       }
+
+-- | @KeyGen(<principal>, <ltk>)@ event fact.
+keyGenFact :: T.Text -> T.Text -> SapicNFact SapicLVar
+keyGenFact prin ltk =
+  protoFact Linear "KeyGen"
+    [ pubTerm (T.unpack prin)
+    , varTerm (mkSapicVar ltk)
+    ]
 
 -- | Per-principal walking context. Carries:
 --
@@ -320,7 +404,36 @@ data LowerCtx = LowerCtx
   { lcReceived       :: !(Set.Set T.Text)
   , lcPrincipalNames :: !(Set.Set T.Text)
   , lcPublicParams   :: !(Set.Set T.Text)
+  , -- | Which principal we are currently lowering. Used to look
+    -- up Running/Commit event placements in 'lcAgreementMap'.
+    lcCurrentPrincipal :: !T.Text
+  , -- | Per-(principal, step label) list of agreement events
+    -- ('Running'/'Commit') to inject into that step's process
+    -- continuation. Computed once per protocol from the verify
+    -- block, then consulted during step lowering.
+    lcAgreementMap :: !(M.Map (T.Text, T.Text) [AgreementEvent])
   }
+
+-- | A Running or Commit event placed by 'computeAgreementPlacements'
+-- on a particular (principal, step) pair.
+--
+-- Both constructors store the LEMMA's role names @(i, r)@. The
+-- placement decides which side emits which event:
+--
+--   * 'AgreeCommit' is emitted by @i@ at @i@'s last step. The
+--     resulting fact is @Commit(\'i\', \'r\', \<\'i\', \'r\', \'agreed\'\>)@,
+--     so the lemma's @Commit(a, b, \<\'I\', \'R\', t\>)@ pattern
+--     unifies with @a -> 'i', b -> 'r', t -> 'agreed'@.
+--
+--   * 'AgreeRunning' is emitted by @r@ at @r@'s first step. The
+--     resulting fact is @Running(\'r\', \'i\', \<\'i\', \'r\', \'agreed\'\>)@,
+--     so the lemma's @Running(b, a, \<\'I\', \'R\', t\>)@ pattern
+--     (note the swapped @a@/@b@ in Lowe's form) unifies with
+--     @b -> 'r', a -> 'i', t -> 'agreed'@.
+data AgreementEvent
+  = AgreeRunning !T.Text !T.Text  -- ^ (i, r) — emitted by r
+  | AgreeCommit  !T.Text !T.Text  -- ^ (i, r) — emitted by i
+  deriving (Show, Eq)
 
 -- | The role this principal plays in a given step.
 data StepRole = RSender | RReceiver | RLocalActor
@@ -361,26 +474,74 @@ stepSequence ctx ((s,r):rest) k =
 --     requires, claims) and do not happen on the receiver. This is
 --     the standard message-passing semantics from design step 2.
 --   * Local actor: same as sender but no 'out'.
+--
+-- After all of the above, any 'AgreementEvent's that the
+-- placement map prescribes for this (principal, step) pair are
+-- appended as Sapic 'Event' actions. Tamarin lemma templates from
+-- §2.3 quantify over the resulting 'Running'/'Commit' action facts.
 lowerStep :: LowerCtx -> Step -> StepRole -> PlainProcess -> PlainProcess
-lowerStep ctx s role = case role of
-  RSender     -> foldSenderStmts (stepBody s)
-  RLocalActor -> foldSenderStmts (stepBody s)
-  RReceiver   -> emitReceive (stepBody s)
+lowerStep ctx s role k =
+    let kWithAgreements = appendAgreementEvents ctx (stepLabel s) k
+    in case role of
+         RSender     -> foldSenderStmts (stepBody s) kWithAgreements
+         RLocalActor -> foldSenderStmts (stepBody s) kWithAgreements
+         RReceiver   -> emitReceive (stepBody s) kWithAgreements
   where
-    foldSenderStmts []     k = k
-    foldSenderStmts (x:xs) k = lowerStmt ctx role x (foldSenderStmts xs k)
+    foldSenderStmts []     kont = kont
+    foldSenderStmts (x:xs) kont = lowerStmt ctx role x (foldSenderStmts xs kont)
 
     -- The receiver only consumes the wire message. We find the
     -- (single) 'SSend' in the body and emit a 'ChIn' for it. If
     -- there is no SSend (a `local` step accidentally tagged as
     -- network) we emit nothing.
-    emitReceive body k = case [e | SSend e _ <- body] of
-      []      -> k
+    emitReceive body kont = case [e | SSend e _ <- body] of
+      []      -> kont
       (e : _) ->
         ProcessAction
           (ChIn Nothing (lowerExprPat ctx e) Set.empty)
           mempty
-          k
+          kont
+
+-- | Append the agreement events for the current (principal, step)
+-- pair to the continuation, in the order they appear in the
+-- placement map. Each event becomes a Sapic 'Event' action.
+appendAgreementEvents
+  :: LowerCtx -> T.Text -> PlainProcess -> PlainProcess
+appendAgreementEvents ctx label k =
+  let key    = (lcCurrentPrincipal ctx, label)
+      events = M.findWithDefault [] key (lcAgreementMap ctx)
+  in  foldr wrap k events
+  where
+    -- Commit(a, b, <I, R, t>) on the committer's side: a=I, b=R.
+    wrap (AgreeCommit i r) acc =
+      ProcessAction (Event (agreementFact "Commit" i r i r)) mempty acc
+    -- Running(b, a, <I, R, t>) on the running party's side: b=R, a=I.
+    wrap (AgreeRunning i r) acc =
+      ProcessAction (Event (agreementFact "Running" r i i r)) mempty acc
+
+-- | Build a Running/Commit action fact whose third argument is a
+-- 3-tuple @\<\'I\', \'R\', \'agreed\'\>@. This shape matches the
+-- @\<\'I\', \'R\', t\>@ pattern in the §2.3 lemma templates: the
+-- lemma's quantified @t@ unifies with the literal @\'agreed\'@.
+--
+-- @arg1@ and @arg2@ are the first two positional args (committer
+-- and running party, in the order Lowe's form prescribes); @i@
+-- and @r@ are the lemma's role names used for the role-tag tuple.
+agreementFact
+  :: String -> T.Text -> T.Text -> T.Text -> T.Text
+  -> SapicNFact SapicLVar
+agreementFact tag arg1 arg2 i r =
+  protoFact Linear tag
+    [ pubTerm (T.unpack arg1)
+    , pubTerm (T.unpack arg2)
+    , fAppPair
+        ( pubTerm (T.unpack i)
+        , fAppPair
+            ( pubTerm (T.unpack r)
+            , pubTerm "agreed"
+            )
+        )
+    ]
 
 -- | Collect the variable names that a /receiver/ binds when it
 -- consumes the wire message of a step. Only the @SSend@'s
