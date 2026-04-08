@@ -1,0 +1,64 @@
+// ISO 9798-3 — signed Diffie-Hellman mutual authentication.
+// This is the worked example from design step 4. It is the canonical
+// v0.0 fixture: small enough to read top-to-bottom, exercises every
+// pre-`verify` construct (generates / knows / new / let / require /
+// send / claim secret) and every Lowe-style verify query.
+//
+// Once the Sapic-process lowering is wired up, the round-trip test
+// is to compile this file with clemc and confirm the resulting
+// theory verifies the same lemmas as
+// examples/ake/dh/UM_three_pass.spthy.
+
+protocol ISO_DH {
+
+  builtins { diffie_hellman, signing, hashing }
+
+  principal A {
+    generates    skA
+    knows public pkA = PK(skA)
+    knows public pkB
+  }
+
+  principal B {
+    generates    skB
+    knows public pkB = PK(skB)
+    knows public pkA
+  }
+
+  step m1 : A -> B {
+    new x
+    send 'g'^x
+  }
+
+  step m2 : B -> A {
+    new y
+    let sigB = SIGN(skB, <'g'^x, 'g'^y, A>)
+    send <'g'^y, sigB>
+  }
+
+  step m3 : A -> B {
+    require VERIFY(pkB, <'g'^x, 'g'^y, A>, sigB)
+    let sigA = SIGN(skA, <'g'^y, 'g'^x, B>)
+    let kA   = H('g'^y ^ x)
+    send sigA
+    claim secret(kA)
+  }
+
+  step m4 : B local {
+    require VERIFY(pkA, <'g'^y, 'g'^x, B>, sigA)
+    let kB = H('g'^x ^ y)
+    claim secret(kB)
+  }
+
+  verify {
+    executable
+    secrecy(kA)
+    secrecy(kB)
+    forward_secrecy(kA)
+    forward_secrecy(kB)
+    injective_agreement(A, B, [kA])
+    injective_agreement(B, A, [kB])
+    authentication(A, B)
+    authentication(B, A)
+  }
+}

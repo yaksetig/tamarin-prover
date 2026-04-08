@@ -1,0 +1,121 @@
+name:               tamarin-prover-clementine
+cabal-version:      >= 1.10
+build-type:         Simple
+version:            0.1.0
+license:            GPL
+license-file:       LICENSE
+category:           Theorem Provers
+author:             Clementine contributors
+maintainer:         tamarin-dev@googlegroups.com
+copyright:          2026
+
+synopsis:           Verifpal-style high-level frontend for Tamarin via Sapic.
+
+description:        Clementine is a principal-centric surface language for the
+                    Tamarin prover. It targets the same audience as Verifpal
+                    (analysts who think in terms of A->B messages rather than
+                    process algebra) and compiles via Sapic to multiset
+                    rewriting rules.
+                    .
+                    This is a work-in-progress v0.0 scaffold; see the design
+                    notes in this directory for the planned semantics.
+
+homepage:           https://tamarin-prover.github.io/
+
+source-repository head
+  type:     git
+  location: https://github.com/tamarin-prover/tamarin-prover.git
+
+----------------------
+-- flags
+----------------------
+
+flag with-sapic
+    description: Build the Clementine.LowerSapic module, which produces
+                 a real Theory.OpenTheory by lowering to a Sapic
+                 process and calling Sapic.translate. Requires a
+                 working tamarin-prover-{utils,term,theory,sapic}
+                 workspace; off by default because of the pre-existing
+                 fclabels-1.x toolchain drift on modern GHCs.
+    default:     False
+    manual:      True
+
+----------------------
+-- library stanzas
+----------------------
+
+library
+    default-language: GHC2021
+    ghc-options:      -Wall -fwarn-tabs
+
+    -- v0.0: only depends on portable libraries. The tamarin-prover-*
+    -- libraries (utils, term, theory, sapic) are pulled in by the
+    -- "with-sapic" cabal flag (off by default) once Clementine.LowerSapic
+    -- is wired through Sapic.translate to produce a real OpenTheory.
+    -- Until then the default lowering pass returns a self-contained
+    -- CompiledTheory summary.
+    build-depends:
+        base
+      , bytestring
+      , containers
+      , file-embed
+      , mtl
+      , parsec
+      , text
+      , exceptions
+
+    hs-source-dirs: src
+
+    exposed-modules:
+        Clementine
+      , Clementine.AST
+      , Clementine.Parser
+      , Clementine.Lower
+      , Clementine.Errors
+      , Clementine.SourceMap
+
+    if flag(with-sapic)
+        build-depends:
+            tamarin-prover-utils
+          , tamarin-prover-term
+          , tamarin-prover-theory
+          , tamarin-prover-sapic
+        exposed-modules:
+            Clementine.LowerSapic
+
+    default-extensions:
+        OverloadedStrings
+      , LambdaCase
+
+----------------------
+-- executable stanzas
+----------------------
+
+executable clemc
+    default-language: GHC2021
+    hs-source-dirs:   app
+    main-is:          Main.hs
+    ghc-options:      -Wall -fwarn-tabs
+    build-depends:
+        base
+      , text
+      , tamarin-prover-clementine
+    default-extensions:
+        OverloadedStrings
+      , LambdaCase
+
+----------------------
+-- test stanzas
+----------------------
+
+test-suite clementine-tests
+    type:             exitcode-stdio-1.0
+    default-language: GHC2021
+    hs-source-dirs:   test
+    main-is:          Spec.hs
+    build-depends:
+        base
+      , tamarin-prover-clementine
+    default-extensions:
+        OverloadedStrings
+      , LambdaCase

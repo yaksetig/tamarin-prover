@@ -17,6 +17,7 @@ cabal.sandbox.config
 
 *.spthy.out
 *.spthy.tmp
+*.clem.sourcemap.json
 
 *.hi
 *.o

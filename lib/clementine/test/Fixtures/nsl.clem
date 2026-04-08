@@ -1,0 +1,65 @@
+// Needham-Schroeder-Lowe public key protocol (3-message variant).
+//
+// Hand-port of examples/classic/NSLPK3.spthy. Uses explicit message
+// tags '1', '2', '3' inside each ciphertext to break the open chains
+// syntactically — the same trick the original .spthy comments call
+// out as the alternative to a sources lemma.
+//
+// Differential expectation: when Clementine.Lower is wired through
+// Sapic, compiling this fixture and running tamarin-prover --prove
+// must verify the same lemmas as
+//   examples/classic/NSLPK3.spthy
+// modulo lemma renaming.
+//
+//   nonce_secrecy   -> secrecy(ni), secrecy(nr)
+//   injective_agree -> injective_agreement(I, R, [ni, nr])
+//                      injective_agreement(R, I, [ni, nr])
+//   session_key_setup_possible -> executable
+
+protocol NSLPK3 {
+
+  builtins { asymmetric_encryption }
+
+  principal I {
+    generates    skI
+    knows public pkI = PK(skI)
+    knows public pkR
+  }
+
+  principal R {
+    generates    skR
+    knows public pkR = PK(skR)
+    knows public pkI
+  }
+
+  step m1 : I -> R {
+    new ni
+    send AENC(<'1', ni, I>, pkR)
+  }
+
+  step m2 : R -> I {
+    new nr
+    send AENC(<'2', ni, nr, R>, pkI)
+  }
+
+  step m3 : I -> R {
+    send AENC(<'3', nr>, pkR)
+    claim secret(ni)
+    claim secret(nr)
+  }
+
+  step m4 : R local {
+    claim secret(ni)
+    claim secret(nr)
+  }
+
+  verify {
+    executable
+    secrecy(ni)
+    secrecy(nr)
+    injective_agreement(I, R, [ni, nr])
+    injective_agreement(R, I, [ni, nr])
+    authentication(I, R)
+    authentication(R, I)
+  }
+}
