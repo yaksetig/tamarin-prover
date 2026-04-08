@@ -353,14 +353,17 @@ computePubKeyMap = M.fromListWith (\_ x -> x) . concatMap forPrincipal
 -- corresponding 'Running'/'Commit' events should be emitted in the
 -- lowered process.
 --
--- Placement rule (a simplified form of Clementine design step 3
--- §3.2):
+-- Placement rule (Clementine design step 3 §3.2):
 --
---   * 'Commit' on the initiator @i@'s side at the LAST step in
---     which @i@ participates.
+--   * 'Commit' on the initiator @i@'s side at the LATEST step in
+--     which all of the agreed terms are in @i@'s scope. Since
+--     state-fact carrying is monotonic, this is always @i@'s last
+--     step (after the latest binding step among the agreed terms).
 --
---   * 'Running' on the responder @r@'s side at the FIRST step in
---     which @r@ participates.
+--   * 'Running' on the responder @r@'s side at the EARLIEST step
+--     in which all of the agreed terms are in @r@'s scope. This
+--     is the maximum binding-step of the agreed terms on @r@'s
+--     side.
 --
 -- The result is a map from (principal name, step label) to the
 -- list of events that should be appended to that step's process.
@@ -369,41 +372,138 @@ computeAgreementPlacements
 computeAgreementPlacements p =
   M.fromListWith (++) (concatMap forQuery (protoVerify p))
   where
+    -- Per-principal binding-step maps, computed once.
+    bindingSteps :: M.Map T.Text (M.Map T.Text Int)
+    bindingSteps = M.fromList
+      [ (prinName pr, computeBindingSteps pr (protoSteps p))
+      | pr <- protoPrincipals p
+      ]
+
     forQuery :: Query -> [((T.Text, T.Text), [AgreementEvent])]
     forQuery q = case q of
-      QInjAgreement     i r _ _ -> placeAgreement i r
-      QNonInjAgreement  i r _ _ -> placeAgreement i r
-      QAuthentication   i r _   -> placeAgreement i r
-      _                         -> []
+      QInjAgreement     i r ts _ -> placeAgreement i r ts
+      QNonInjAgreement  i r ts _ -> placeAgreement i r ts
+      -- Aliveness's lemma template references @Commit(a, b, <'I',
+      -- 'R', t>)@ but doesn't constrain @t@ — it just needs SOME
+      -- Commit to fire its hypothesis. So we don't emit a separate
+      -- placeholder Commit for QAuthentication; instead it
+      -- piggybacks on whichever inj_agree / agreement event already
+      -- exists with the same role pair. If neither query exists
+      -- the aliveness lemma is vacuously true (no Commit anywhere)
+      -- and Tamarin verifies it in zero steps.
+      QAuthentication   _ _ _    -> []
+      _                          -> []
 
-    placeAgreement :: T.Text -> T.Text -> [((T.Text, T.Text), [AgreementEvent])]
-    placeAgreement i r =
-      let mLast  = lastStepOnSide  i
-          mFirst = firstStepOnSide r
+    placeAgreement
+      :: T.Text -> T.Text -> [TermRef]
+      -> [((T.Text, T.Text), [AgreementEvent])]
+    placeAgreement i r ts =
+      let iBindings = M.findWithDefault M.empty i bindingSteps
+          rBindings = M.findWithDefault M.empty r bindingSteps
+          tNames    = map trVar ts
+
+          -- The maximum binding-step index of the agreed terms on
+          -- a given side. Terms that aren't bound on this side
+          -- fall back to index @0@ (the start of the protocol);
+          -- when the lemma references a term that exists only on
+          -- the other side (e.g. ISO-DH's @kA@ which is bound on
+          -- A's side as @kA@ but on B's side as @kB@), the event
+          -- still gets placed and the agreement falls back to
+          -- aliveness-style matching.
+          maxBinding :: M.Map T.Text Int -> Int
+          maxBinding bnds = case tNames of
+            [] -> 0
+            _  -> maximum [M.findWithDefault 0 t bnds | t <- tNames]
+
+          iIdx = maxBinding iBindings
+          rIdx = maxBinding rBindings
+
+          -- Step in protoSteps where principal `n` participates,
+          -- whose index is at least `idx`. We take the LAST such
+          -- step for the committer (latest in scope) and the
+          -- FIRST such step for the running party (earliest).
+          stepAt n idx pickFn =
+            case filter (\(_, s) -> involves n s)
+                        (zip [0 :: Int ..] (protoSteps p)) of
+              [] -> Nothing
+              xs ->
+                case filter (\(j, _) -> j >= idx) xs of
+                  [] -> case xs of
+                    [] -> Nothing
+                    _  -> Just (snd (pickFn xs))   -- fallback
+                  ys -> Just (snd (pickFn ys))
+
+          mCommit  = stepAt i iIdx last
+          mRunning = stepAt r rIdx head
       in  catMaybesPair
-            [ fmap (\s -> ((i, stepLabel s), [AgreeCommit  i r])) mLast
-            , fmap (\s -> ((r, stepLabel s), [AgreeRunning r i])) mFirst
+            [ fmap (\s -> ((i, stepLabel s), [AgreeCommit  i r ts])) mCommit
+            , fmap (\s -> ((r, stepLabel s), [AgreeRunning i r ts])) mRunning
             ]
-
-    -- A principal participates in a step if it is the source, the
-    -- target of a network arrow, or the local actor.
-    involves :: T.Text -> Step -> Bool
-    involves n s = stepFrom s == n || case stepKind s of
-      StepNetwork tgt _ -> tgt == n
-      _                 -> False
-
-    lastStepOnSide :: T.Text -> Maybe Step
-    lastStepOnSide n = case filter (involves n) (protoSteps p) of
-      [] -> Nothing
-      ss -> Just (last ss)
-
-    firstStepOnSide :: T.Text -> Maybe Step
-    firstStepOnSide n = case filter (involves n) (protoSteps p) of
-      []     -> Nothing
-      (s:_)  -> Just s
 
     catMaybesPair :: [Maybe a] -> [a]
     catMaybesPair = mapMaybe id
+
+-- | Per-principal binding-step map: for every variable that
+-- becomes in scope on this principal's side, the index (in
+-- 'protoSteps' order) of the step that first binds it.
+--
+-- Initial scope (the principal's own block, including
+-- @generates@ and @knows@) is recorded with index @-1@, so it
+-- always satisfies any @>= 0@ check downstream.
+computeBindingSteps :: Principal -> [Step] -> M.Map T.Text Int
+computeBindingSteps pr allSteps =
+    foldl' addStepBindings initial
+      (zip [0 ..] (filter (involves (prinName pr)) allSteps))
+  where
+    -- Initial scope from the principal block.
+    initial :: M.Map T.Text Int
+    initial = M.fromList
+      [ (n, -1)
+      | k <- prinKnows pr
+      , n <- case k of
+          KGenerates    n' _   -> [n']
+          KKnowsPublic  n' _ _ -> [n']
+          KKnowsPrivate n' _   -> [n']
+      ]
+
+    addStepBindings :: M.Map T.Text Int -> (Int, Step) -> M.Map T.Text Int
+    addStepBindings m (idx, s) =
+      let role = roleOf (prinName pr) s
+          newVars = case role of
+            RSender     -> Set.toList (foldMap senderBindings (stepBody s))
+            RLocalActor -> Set.toList (foldMap senderBindings (stepBody s))
+            RReceiver   -> Set.toList (foldMap receiverBindings (stepBody s))
+      in  foldr (\v -> M.insertWith (\_ old -> old) v idx) m newVars
+
+    senderBindings :: StepStmt -> Set.Set T.Text
+    senderBindings stmt = case stmt of
+      SNew n _              -> Set.singleton n
+      SLet n _ _            -> Set.singleton n
+      _                     -> Set.empty
+
+    -- The receiver only binds the variables that appear in the
+    -- SSend's expression (it doesn't run the new/let/require).
+    receiverBindings :: StepStmt -> Set.Set T.Text
+    receiverBindings (SSend e _) = collectVarsExpr e
+    receiverBindings _           = Set.empty
+
+    roleOf :: T.Text -> Step -> StepRole
+    roleOf n s
+      | stepFrom s == n = case stepKind s of
+          StepLocal       -> RLocalActor
+          StepNetwork _ _ -> RSender
+      | otherwise = case stepKind s of
+          StepNetwork tgt _ | tgt == n -> RReceiver
+          _                            -> RLocalActor   -- defensive
+
+-- | Whether a principal participates in a step (sender, receiver,
+-- or local actor).
+involves :: T.Text -> Step -> Bool
+involves n s = stepFrom s == n || case stepKind s of
+  StepNetwork tgt _ -> tgt == n
+  _                 -> False
+
+-- (foldl' is already in Prelude in GHC 9.14; no local definition needed.)
 
 -- | Lower one principal: emit per-session @KeyGen@ events for the
 -- long-term keys (which are 'new'-bound at the protocol level
@@ -423,11 +523,13 @@ lowerPrincipal principalNames placements pkMap allSteps pr =
     ProcessAction Rep mempty
       $ keyGenEvents
       $ ProcessComb NDC mempty
-          (stepSequence ctx0 (relevantSteps (prinName pr) allSteps)
+          (stepSequence bindingMap ctx0
+                         (relevantSteps (prinName pr) allSteps)
                          (ProcessNull mempty))           -- left: protocol
           (revealBranch (prinName pr) (map mkSapicVar genKeys))  -- right: reveal
   where
-    genKeys = [n | KGenerates n _ <- prinKnows pr]
+    genKeys    = [n | KGenerates n _ <- prinKnows pr]
+    bindingMap = computeBindingSteps pr allSteps
 
     -- For each long-term key generated by this principal, emit a
     -- `KeyGen($P, ~k)` event so aliveness lemmas can witness it.
@@ -522,52 +624,67 @@ data LowerCtx = LowerCtx
 -- | A Running or Commit event placed by 'computeAgreementPlacements'
 -- on a particular (principal, step) pair.
 --
--- Both constructors store the LEMMA's role names @(i, r)@. The
--- placement decides which side emits which event:
+-- Each constructor carries the lemma's role names @(i, r)@ and
+-- the list of agreed terms from the @verify@ block. The agreed
+-- terms become a payload tuple inside the action fact, so the
+-- lemma template's @\<\'I\', \'R\', t\>@ pattern unifies with the
+-- specific terms each session agreed on (rather than a constant
+-- placeholder, which would make different sessions
+-- indistinguishable and break injectivity).
 --
---   * 'AgreeCommit' is emitted by @i@ at @i@'s last step. The
---     resulting fact is @Commit(\'i\', \'r\', \<\'i\', \'r\', \'agreed\'\>)@,
---     so the lemma's @Commit(a, b, \<\'I\', \'R\', t\>)@ pattern
---     unifies with @a -> 'i', b -> 'r', t -> 'agreed'@.
---
---   * 'AgreeRunning' is emitted by @r@ at @r@'s first step. The
---     resulting fact is @Running(\'r\', \'i\', \<\'i\', \'r\', \'agreed\'\>)@,
---     so the lemma's @Running(b, a, \<\'I\', \'R\', t\>)@ pattern
---     (note the swapped @a@/@b@ in Lowe's form) unifies with
---     @b -> 'r', a -> 'i', t -> 'agreed'@.
+--   * 'AgreeCommit' is emitted by @i@ at @i@'s latest step in
+--     which all the agreed terms are in scope.
+--   * 'AgreeRunning' is emitted by @r@ at @r@'s earliest step in
+--     which all the agreed terms are in scope.
 data AgreementEvent
-  = AgreeRunning !T.Text !T.Text  -- ^ (i, r) — emitted by r
-  | AgreeCommit  !T.Text !T.Text  -- ^ (i, r) — emitted by i
+  = AgreeRunning !T.Text !T.Text ![TermRef]  -- ^ (i, r, terms) — emitted by r
+  | AgreeCommit  !T.Text !T.Text ![TermRef]  -- ^ (i, r, terms) — emitted by i
   deriving (Show, Eq)
 
 -- | The role this principal plays in a given step.
 data StepRole = RSender | RReceiver | RLocalActor
 
 -- | Steps that this principal participates in, in declaration order,
--- tagged with the role the principal plays.
-relevantSteps :: T.Text -> [Step] -> [(Step, StepRole)]
-relevantSteps p = mapMaybe pick
+-- tagged with the role the principal plays and the step's index in
+-- 'protoSteps' (so the binding-map lookups stay aligned).
+relevantSteps :: T.Text -> [Step] -> [(Step, StepRole, Int)]
+relevantSteps p = mapMaybe pick . zip [0 ..]
   where
-    pick s
+    pick (i, s)
       | stepFrom s == p = case stepKind s of
-          StepLocal       -> Just (s, RLocalActor)
-          StepNetwork _ _ -> Just (s, RSender)
+          StepLocal       -> Just (s, RLocalActor, i)
+          StepNetwork _ _ -> Just (s, RSender, i)
       | otherwise = case stepKind s of
-          StepNetwork tgt _ | tgt == p -> Just (s, RReceiver)
+          StepNetwork tgt _ | tgt == p -> Just (s, RReceiver, i)
           _                            -> Nothing
 
-stepSequence :: LowerCtx -> [(Step, StepRole)] -> PlainProcess -> PlainProcess
-stepSequence _   []           k = k
-stepSequence ctx ((s,r):rest) k =
-  -- After a receive, the variables in the sent expression become
-  -- "received" on this principal's side and any subsequent
-  -- reference to them must use the pat_-prefixed name. Sender and
-  -- local steps do not change the context.
+stepSequence
+  :: M.Map T.Text Int
+  -> LowerCtx
+  -> [(Step, StepRole, Int)]
+  -> PlainProcess
+  -> PlainProcess
+stepSequence _        _   []             k = k
+stepSequence bindings ctx ((s,r,idx):rest) k =
+  -- After a receive, /new/ variables in the sent expression
+  -- become "received" on this principal's side. A variable is
+  -- new only if the principal didn't already bind it locally
+  -- in a STRICTLY EARLIER step — otherwise the receive just
+  -- confirms the value the principal already has, and references
+  -- should keep resolving to the local fresh (not get
+  -- pat-prefixed).
   let ctx' = case r of
-        RReceiver -> ctx { lcReceived = lcReceived ctx
-                                       <> collectVarsBody (stepBody s) }
-        _         -> ctx
-  in  lowerStep ctx s r (stepSequence ctx' rest k)
+        RReceiver ->
+          let allMentioned = collectVarsBody (stepBody s)
+              alreadyLocal = Set.fromList
+                [ v | v <- Set.toList allMentioned
+                    , Just bIdx <- [M.lookup v bindings]
+                    , bIdx < idx
+                ]
+              newlyReceived = allMentioned `Set.difference` alreadyLocal
+          in  ctx { lcReceived = lcReceived ctx <> newlyReceived }
+        _ -> ctx
+  in  lowerStep ctx s r (stepSequence bindings ctx' rest k)
 
 -- | Lower one step from one principal's perspective.
 --
@@ -609,7 +726,12 @@ lowerStep ctx s role k =
 
 -- | Append the agreement events for the current (principal, step)
 -- pair to the continuation, in the order they appear in the
--- placement map. Each event becomes a Sapic 'Event' action.
+-- placement map. Each event becomes a Sapic 'Event' action whose
+-- payload tuple includes the agreed terms lowered against the
+-- /current principal's/ scope (so receiver-side @ni@ resolves to
+-- @~patNi@ on the receiver's side and to @~ni@ on the originator's
+-- side, and Tamarin's matcher can unify them via the wire-tracking
+-- chain).
 appendAgreementEvents
   :: LowerCtx -> T.Text -> PlainProcess -> PlainProcess
 appendAgreementEvents ctx label k =
@@ -618,24 +740,26 @@ appendAgreementEvents ctx label k =
   in  foldr wrap k events
   where
     -- Commit(a, b, <I, R, t>) on the committer's side: a=I, b=R.
-    wrap (AgreeCommit i r) acc =
-      ProcessAction (Event (agreementFact "Commit" i r i r)) mempty acc
+    wrap (AgreeCommit i r ts) acc =
+      ProcessAction (Event (agreementFact ctx "Commit" i r i r ts)) mempty acc
     -- Running(b, a, <I, R, t>) on the running party's side: b=R, a=I.
-    wrap (AgreeRunning i r) acc =
-      ProcessAction (Event (agreementFact "Running" r i i r)) mempty acc
+    wrap (AgreeRunning i r ts) acc =
+      ProcessAction (Event (agreementFact ctx "Running" r i i r ts)) mempty acc
 
 -- | Build a Running/Commit action fact whose third argument is a
--- 3-tuple @\<\'I\', \'R\', \'agreed\'\>@. This shape matches the
--- @\<\'I\', \'R\', t\>@ pattern in the §2.3 lemma templates: the
--- lemma's quantified @t@ unifies with the literal @\'agreed\'@.
+-- 3-tuple @\<\'I\', \'R\', \<agreed_terms\>\>@. The lemma template's
+-- @\<\'I\', \'R\', t\>@ pattern unifies with the agreed-terms
+-- tuple via the universally-quantified @t@.
 --
--- @arg1@ and @arg2@ are the first two positional args (committer
--- and running party, in the order Lowe's form prescribes); @i@
--- and @r@ are the lemma's role names used for the role-tag tuple.
+-- The agreed terms are lowered through 'lowerExpr' against the
+-- current principal's context, so each side emits the same value
+-- under different local names (the names unify via Tamarin's
+-- backward-chaining wire tracking).
 agreementFact
-  :: String -> T.Text -> T.Text -> T.Text -> T.Text
+  :: LowerCtx
+  -> String -> T.Text -> T.Text -> T.Text -> T.Text -> [TermRef]
   -> SapicNFact SapicLVar
-agreementFact tag arg1 arg2 i r =
+agreementFact ctx tag arg1 arg2 i r ts =
   protoFact Linear tag
     [ pubTerm (T.unpack arg1)
     , pubTerm (T.unpack arg2)
@@ -643,10 +767,27 @@ agreementFact tag arg1 arg2 i r =
         ( pubTerm (T.unpack i)
         , fAppPair
             ( pubTerm (T.unpack r)
-            , pubTerm "agreed"
+            , agreedTermsTuple ts
             )
         )
     ]
+  where
+    -- Right-fold the agreed terms into a tuple. With zero terms
+    -- (e.g. for `authentication(I, R)` which has no payload), we
+    -- emit a stable placeholder constant so the lemma still has
+    -- something to unify against.
+    agreedTermsTuple :: [TermRef] -> SapicNTerm SapicLVar
+    agreedTermsTuple []     = pubTerm "noAgreed"
+    agreedTermsTuple [tr]   = lowerTermRef tr
+    agreedTermsTuple (x:xs) = fAppPair (lowerTermRef x, agreedTermsTuple xs)
+
+    lowerTermRef :: TermRef -> SapicNTerm SapicLVar
+    lowerTermRef tr =
+      -- The TermRef's variable name is looked up via the same
+      -- resolveVar that handles step-body variable resolution, so
+      -- it picks up the principal's local fresh names, received
+      -- pat-vars, and pkMap entries automatically.
+      resolveVar ctx (trVar tr)
 
 -- | Collect the variable names that a /receiver/ binds when it
 -- consumes the wire message of a step. Only the @SSend@'s

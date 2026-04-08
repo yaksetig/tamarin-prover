@@ -159,4 +159,4 @@ data TermRef = TermRef
   , trStep      :: !(Maybe Text)
   , trVar       :: !Text
   , trPos       :: !SrcPos
-  } deriving (Show)
+  } deriving (Show, Eq)
