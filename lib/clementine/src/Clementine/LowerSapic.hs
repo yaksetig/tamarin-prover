@@ -355,15 +355,32 @@ lowerPrincipal principalNames placements allSteps pr =
     -- For each long-term key, emit `new ~k` immediately followed by
     -- `event KeyGen(<principal>, ~k)`. The KeyGen action fact is
     -- what design step 2 §2.3.5 (Lowe aliveness) quantifies over.
-    withFreshKeysAndKeyGen []     k = k
-    withFreshKeysAndKeyGen (n:ns) k =
-      let v = mkSapicVar n
-          rest = withFreshKeysAndKeyGen ns k
+    --
+    -- After the last `new`, insert an NDC (non-deterministic
+    -- choice): one branch continues with the normal protocol, the
+    -- other reveals the long-term keys via an `event Reveal($P)`
+    -- followed by `out(~k1); ... out(~kn); 0`. The two branches
+    -- share the same fresh names, so the lemma's compromise-excuse
+    -- clause has a real witness without diverging the protocol's
+    -- session identity from the reveal session.
+    withFreshKeysAndKeyGen freshes k =
+      let allLtks = map mkSapicVar freshes
+      in  buildKeysAndKeyGens freshes allLtks
+            (ProcessComb NDC mempty
+                k                                       -- left: protocol
+                (revealBranch (prinName pr) allLtks))   -- right: reveal
+
+    -- Recursively emit `new ~k1; event KeyGen(_, ~k1); new ~k2; ...`
+    -- and finally hand off to the continuation `cont`.
+    buildKeysAndKeyGens []     _      cont = cont
+    buildKeysAndKeyGens (n:ns) (v:vs) cont =
+      let rest = buildKeysAndKeyGens ns vs cont
           keyGenEvt = ProcessAction
                         (Event (keyGenFact (prinName pr) n))
                         mempty
                         rest
       in  ProcessAction (New v) mempty keyGenEvt
+    buildKeysAndKeyGens (_:_) [] _ = ProcessNull mempty   -- impossible
 
     ctx0 = LowerCtx
       { lcReceived         = Set.empty
@@ -381,6 +398,23 @@ keyGenFact prin ltk =
     [ pubTerm (T.unpack prin)
     , varTerm (mkSapicVar ltk)
     ]
+
+-- | The reveal branch of a principal's NDC. Emits a 'Reveal'
+-- event tagged with the principal's name, then sends every
+-- long-term key on the public channel.
+revealBranch :: T.Text -> [SapicLVar] -> PlainProcess
+revealBranch prin ltks =
+    ProcessAction (Event (revealFact prin)) mempty
+      (foldr outLtk (ProcessNull mempty) ltks)
+  where
+    outLtk v acc =
+      ProcessAction (ChOut Nothing (varTerm v)) mempty acc
+
+-- | @Reveal(<principal>)@ event fact. Lemma templates from
+-- design step 2 §2.3.1 / §2.3.2 quantify over this for the
+-- compromise-excuse clause.
+revealFact :: T.Text -> SapicNFact SapicLVar
+revealFact prin = protoFact Linear "Reveal" [pubTerm (T.unpack prin)]
 
 -- | Per-principal walking context. Carries:
 --
