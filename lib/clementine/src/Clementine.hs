@@ -51,6 +51,7 @@ import           Clementine.AST
 import           Clementine.Errors
 import           Clementine.Lower
 import qualified Clementine.Parser as Parser
+import qualified Clementine.Wellformed as W
 
 #ifdef WITH_SAPIC
 import           Control.Exception     (SomeException, try)
@@ -62,19 +63,26 @@ import qualified Clementine.LowerSapic as LowerSapic
 -- parse time.
 type CompileResult = Either ClementineError CompiledTheory
 
--- | Parse and lower a .clem file from disk.
+-- | Parse, run wellformedness checks, then lower a .clem file
+-- from disk. Wellformedness errors abort compilation; warnings
+-- are returned alongside the result via the auxiliary
+-- 'compileFileVerbose'.
 compileFile :: FilePath -> IO CompileResult
 compileFile fp = do
   parsed <- Parser.parseProtocolFile fp
   pure $ case parsed of
     Left pe   -> Left (parseErrorToClementine pe)
-    Right ast -> Right (lowerProtocol ast)
+    Right ast -> case W.wellformedErrors (W.checkWellformed ast) of
+      (e : _) -> Left e
+      []      -> Right (lowerProtocol ast)
 
 -- | Parse and lower a .clem source given as 'Text'.
 compileText :: FilePath -> Text -> CompileResult
 compileText fp src = case Parser.parseProtocol fp src of
   Left pe   -> Left (parseErrorToClementine pe)
-  Right ast -> Right (lowerProtocol ast)
+  Right ast -> case W.wellformedErrors (W.checkWellformed ast) of
+    (e : _) -> Left e
+    []      -> Right (lowerProtocol ast)
 
 -- | Whether this build of Clementine has the Sapic-backed lowering
 -- compiled in. The @clemc@ driver uses this to decide whether to

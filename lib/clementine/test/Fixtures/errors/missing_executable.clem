@@ -1,0 +1,26 @@
+// Should fail with E0206: verify block has no `executable` query.
+//
+// The Clementine compiler refuses to compile any protocol whose
+// verify block does not include `executable`, because without it
+// every other lemma could be vacuously true (no honest run reaches
+// the action facts the lemmas quantify over).
+
+protocol MissingExecutable {
+  builtins { hashing }
+
+  principal A {
+    generates    skA
+    knows public pkA = PK(skA)
+  }
+
+  step m1 : A local {
+    new x
+    let y = H(x)
+    claim secret(y)
+  }
+
+  verify {
+    secrecy(y)
+    // missing: executable
+  }
+}

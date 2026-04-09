@@ -1,0 +1,22 @@
+// Should fail with E0104: duplicate step label `m1`.
+
+protocol DuplicateStep {
+  builtins { hashing }
+
+  principal A { generates skA }
+  principal B { generates skB }
+
+  step m1 : A -> B {
+    new x
+    send H(x)
+  }
+
+  step m1 : B -> A {        // <-- duplicate label
+    new y
+    send H(y)
+  }
+
+  verify {
+    executable
+  }
+}

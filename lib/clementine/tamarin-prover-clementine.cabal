@@ -74,6 +74,7 @@ library
       , Clementine.Errors
       , Clementine.SourceMap
       , Clementine.Sources
+      , Clementine.Wellformed
 
     if flag(with-sapic)
         cpp-options: -DWITH_SAPIC

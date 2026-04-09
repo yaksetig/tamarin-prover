@@ -1,0 +1,20 @@
+// Should fail with E0209: agreement query references undeclared role.
+
+protocol UndeclaredRole {
+  builtins { hashing }
+
+  principal A {
+    generates skA
+  }
+
+  step m1 : A local {
+    new x
+    claim secret(x)
+  }
+
+  verify {
+    executable
+    secrecy(x)
+    injective_agreement(A, Z, [x])     // <-- Z is not declared
+  }
+}

@@ -1,0 +1,17 @@
+// Should fail with E0103: duplicate principal name `A`.
+
+protocol DuplicatePrincipal {
+  builtins { hashing }
+
+  principal A {
+    generates skA
+  }
+
+  principal A {           // <-- duplicate
+    generates skA2
+  }
+
+  verify {
+    executable
+  }
+}

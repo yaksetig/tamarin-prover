@@ -1,0 +1,20 @@
+// Should fail with E0102: verify block references an undefined term.
+
+protocol UndefinedTermRef {
+  builtins { hashing }
+
+  principal A {
+    generates skA
+  }
+
+  step m1 : A local {
+    new x
+    let y = H(x)
+    claim secret(y)
+  }
+
+  verify {
+    executable
+    secrecy(z)         // <-- z is not bound anywhere
+  }
+}
