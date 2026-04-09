@@ -29,7 +29,8 @@ import           Clementine
 
 positiveFixtures :: [FilePath]
 positiveFixtures =
-  [ "test/Fixtures/iso_dh.clem"
+  [ "test/Fixtures/hello.clem"
+  , "test/Fixtures/iso_dh.clem"
   , "test/Fixtures/nsl.clem"
   ]
 

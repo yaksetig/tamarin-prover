@@ -1,0 +1,40 @@
+// hello.clem — the simplest non-trivial Clementine protocol.
+//
+// Alice picks a fresh secret, encrypts it to Bob's public key,
+// and sends it. Bob receives it. The lemma asserts the adversary
+// can never learn `s` (because they can't decrypt without skB).
+//
+// This is the canonical "hello world" example for Clementine —
+// 30 lines, two principals, one message, one wire transfer, one
+// secrecy claim. After reading this, look at iso_dh.clem and
+// nsl.clem in the same directory for richer examples that use
+// signatures, Diffie-Hellman, multi-step protocols, and the full
+// Lowe injective-agreement / aliveness lemma vocabulary.
+
+protocol Hello {
+
+  builtins { asymmetric_encryption }
+
+  principal A {
+    generates    skA
+    knows public pkA = PK(skA)
+    knows public pkB
+  }
+
+  principal B {
+    generates    skB
+    knows public pkB = PK(skB)
+    knows public pkA
+  }
+
+  step m1 : A -> B {
+    new s
+    send AENC(<'msg', s>, pkB)
+    claim secret(s)
+  }
+
+  verify {
+    executable
+    secrecy(s)
+  }
+}
