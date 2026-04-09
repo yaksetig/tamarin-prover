@@ -177,30 +177,73 @@ freshOccursIn n = go
 -- Lemma synthesis
 --------------------------------------------------------------------------------
 
--- | Build the @auto_sources@ lemma for a protocol. For v0.4 this
--- is a trivially-true lemma annotated @[sources]@; once the
--- detector reports any open chains, the next iteration will
--- synthesize the proper @ChainSrc@/@ChainSnk@ machinery.
+-- | Build the @auto_sources@ lemma for a protocol. The body asserts
+-- that any value bound at a 'ChainSnk' event was either learned by
+-- the adversary (@KU@) or originated from a matching 'ChainSrc' on
+-- the sender's side.
+--
+-- This is the §5 sources lemma in its general form: a single
+-- universally-quantified conjunct that covers every (tag, term)
+-- pair the protocol emits ChainSrc/ChainSnk for. The chain events
+-- are injected by 'Clementine.LowerSapic.computeChainEvents'.
 --
 -- The lemma is returned as a parsable @.spthy@ source string so
 -- the caller can hand it to @parseLemmaWithMacros@ alongside the
--- other Clementine-generated lemmas.
+-- other Clementine-generated lemmas. We always emit the lemma
+-- when the protocol has at least one principal that does both
+-- @new n@ and @send <_, n, _>@ in the same step — i.e. whenever
+-- 'computeChainEvents' would have something to say. The
+-- 'detectOpenChains' check is kept around as documentation but
+-- the lemma fires unconditionally when chain events exist.
 makeAutoSourcesLemma :: Protocol -> Maybe String
-makeAutoSourcesLemma p =
-  case detectOpenChains p of
-    []     -> Nothing               -- no chains, no lemma needed
-    chains -> Just (renderLemma chains)
+makeAutoSourcesLemma p
+  | hasAnyChain p = Just sourcesLemmaSrc
+  | otherwise     = Nothing
   where
-    renderLemma chains =
-      "// Auto-generated sources lemma. Detected " ++
-        show (length chains) ++ " open chain(s).\n" ++
-      "lemma auto_sources [sources]:\n" ++
-      "  all-traces\n" ++
-      "  \"T\""
-      -- The body is `T` (true) for now; the v0.5 commit replaces
-      -- it with conjuncts of the form
-      --   All n #i. ChainSnk_<id>(n) @ i ==>
-      --     (Ex #j. KU(n) @ j & j < i)
-      --   | (Ex #j. ChainSrc_<id>(n) @ j & j < i)
-      -- once we synthesize ChainSrc/ChainSnk action facts on the
-      -- relevant rules during lowering.
+    -- A protocol has chain events whenever any step does both
+    -- a `new n` and a `send` mentioning `n`. This is the same
+    -- condition Clementine.LowerSapic.computeChainEvents uses.
+    hasAnyChain proto =
+      any stepHasChain (protoSteps proto)
+
+    stepHasChain s =
+      let body     = stepBody s
+          freshes  = [ n | SNew n _ <- body ]
+          sentVars = foldr (\stmt acc -> case stmt of
+                              SSend e _ -> collectVarsExpr e <> acc
+                              _         -> acc)
+                           []
+                           body
+      in  any (`elem` sentVars) freshes
+
+    sourcesLemmaSrc = unlines
+      [ "// Auto-generated sources lemma (Clementine §5)."
+      , "//"
+      , "// Asserts that every wire message bound at a ChainSnk"
+      , "// event was either learned by the adversary (via KU) or"
+      , "// originated from a matching ChainSrc earlier in the"
+      , "// trace. The whole-message form (rather than per-variable)"
+      , "// lets Tamarin's matcher unify the wire term directly,"
+      , "// which incidentally connects the sender-side fresh and"
+      , "// the receiver-side pat-bound name (they end up at the"
+      , "// same position inside the unified term)."
+      , "//"
+      , "// This is the same pattern as Tamarin's hand-written NSL"
+      , "// sources lemma in examples/classic/NSLPK3.spthy:103-118."
+      , "lemma auto_sources [sources]:"
+      , "  all-traces"
+      , "  \"All m #i. ChainSnk(m) @ i ==>"
+      , "     (Ex #j. KU(m) @ j & j < i)"
+      , "   | (Ex #j. ChainSrc(m) @ j & j < i)\""
+      ]
+
+-- | Local helper duplicated from 'Clementine.LowerSapic' to avoid
+-- a circular dependency between Sources and LowerSapic. Walks an
+-- 'Expr' and returns the list of free variable names.
+collectVarsExpr :: Expr -> [T.Text]
+collectVarsExpr e = case e of
+  EVar n _    -> [n]
+  EConst _ _  -> []
+  ETup xs _   -> concatMap collectVarsExpr xs
+  EApp _ xs _ -> concatMap collectVarsExpr xs
+  EExp a b _  -> collectVarsExpr a ++ collectVarsExpr b

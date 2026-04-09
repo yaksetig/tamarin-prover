@@ -294,13 +294,14 @@ lowerProtocolToProcess' p =
     -- principal generated its own ~skR independently.
     foldr withFreshLtk
       (parallelOf
-        [ lowerPrincipal principalNames placements pkMap (protoSteps p) prin
+        [ lowerPrincipal principalNames placements chainMap pkMap (protoSteps p) prin
         | prin <- protoPrincipals p
         ])
       allLongTermKeys
   where
     principalNames    = map prinName (protoPrincipals p)
     placements        = computeAgreementPlacements p
+    chainMap          = computeChainEvents p
     allLongTermKeys   = nubText
                           [ n
                           | prin <- protoPrincipals p
@@ -515,11 +516,12 @@ involves n s = stepFrom s == n || case stepKind s of
 lowerPrincipal
   :: [T.Text]
   -> M.Map (T.Text, T.Text) [AgreementEvent]
+  -> M.Map (T.Text, T.Text) [ChainEvent]
   -> M.Map T.Text T.Text
   -> [Step]
   -> Principal
   -> PlainProcess
-lowerPrincipal principalNames placements pkMap allSteps pr =
+lowerPrincipal principalNames placements chainMap pkMap allSteps pr =
     ProcessAction Rep mempty
       $ keyGenEvents
       $ ProcessComb NDC mempty
@@ -551,6 +553,7 @@ lowerPrincipal principalNames placements pkMap allSteps pr =
       , lcCurrentPrincipal = prinName pr
       , lcAgreementMap     = placements
       , lcPubKeyMap        = pkMap
+      , lcChainMap         = chainMap
       }
 
 -- | @KeyGen(<principal>, <ltk>)@ event fact.
@@ -619,7 +622,35 @@ data LowerCtx = LowerCtx
     -- that declares such an equation, then shared across all
     -- principals' lowering contexts.
     lcPubKeyMap :: !(M.Map T.Text T.Text)
+  , -- | Per-(principal, step label) list of chain events
+    -- ('ChainSrc'/'ChainSnk') to inject into that step. Used by
+    -- the §5 sources lemma to bridge sender-side fresh names and
+    -- receiver-side pat-bound names via the wire chain. Computed
+    -- once per protocol; the per-event payload is the variable
+    -- name as a tag plus the actual term reference.
+    lcChainMap :: !(M.Map (T.Text, T.Text) [ChainEvent])
   }
+
+-- | A 'ChainSrc' or 'ChainSnk' event placed by
+-- 'computeChainEvents' on a particular (principal, step) pair.
+--
+-- The payload is the WHOLE @SSend@ expression that triggered the
+-- chain — not just the inner fresh variable. This is the same
+-- pattern as Tamarin's hand-written NSL sources lemma:
+--
+--     IN_R_1_ni(ni, m1) @ i ==>
+--       (Ex #j. KU(m1) @ j & j < i)
+--     | (Ex #j. OUT_I_1(m1) @ j)
+--
+-- Putting the whole message in the action fact lets Tamarin's
+-- [sources] induction unify the wire term directly, which
+-- incidentally connects the sender-side fresh and the
+-- receiver-side pat-bound name (they end up at the same position
+-- inside the unified term).
+data ChainEvent
+  = ChainSource !Expr     -- ^ whole sent expression; emitted by sender
+  | ChainSink   !Expr     -- ^ whole sent expression; emitted by receiver
+  deriving (Show, Eq)
 
 -- | A Running or Commit event placed by 'computeAgreementPlacements'
 -- on a particular (principal, step) pair.
@@ -703,11 +734,12 @@ stepSequence bindings ctx ((s,r,idx):rest) k =
 -- §2.3 quantify over the resulting 'Running'/'Commit' action facts.
 lowerStep :: LowerCtx -> Step -> StepRole -> PlainProcess -> PlainProcess
 lowerStep ctx s role k =
-    let kWithAgreements = appendAgreementEvents ctx (stepLabel s) k
+    let kWithEvents = appendChainEvents ctx (stepLabel s)
+                    $ appendAgreementEvents ctx (stepLabel s) k
     in case role of
-         RSender     -> foldSenderStmts (stepBody s) kWithAgreements
-         RLocalActor -> foldSenderStmts (stepBody s) kWithAgreements
-         RReceiver   -> emitReceive (stepBody s) kWithAgreements
+         RSender     -> foldSenderStmts (stepBody s) kWithEvents
+         RLocalActor -> foldSenderStmts (stepBody s) kWithEvents
+         RReceiver   -> emitReceive (stepBody s) kWithEvents
   where
     foldSenderStmts []     kont = kont
     foldSenderStmts (x:xs) kont = lowerStmt ctx role x (foldSenderStmts xs kont)
@@ -745,6 +777,88 @@ appendAgreementEvents ctx label k =
     -- Running(b, a, <I, R, t>) on the running party's side: b=R, a=I.
     wrap (AgreeRunning i r ts) acc =
       ProcessAction (Event (agreementFact ctx "Running" r i i r ts)) mempty acc
+
+--------------------------------------------------------------------------------
+-- §5 chain events: ChainSrc / ChainSnk
+--
+-- For every protocol step that does both `new n` and `send <expr
+-- containing n>`, the SENDER's side gets a `ChainSrc('n', ~n)`
+-- event after the send, and the RECEIVER's side gets a
+-- `ChainSnk('n', ~patN)` event after the receive. The §5 sources
+-- lemma then asserts:
+--
+--     All tag n #i. ChainSnk(tag, n) @ i ==>
+--       (Ex #j. KU(n) @ j & j < i)
+--     | (Ex #j. ChainSrc(tag, n) @ j & j < i)
+--
+-- which gives Tamarin's matcher the bridge it needs to unify
+-- sender-side fresh names with receiver-side pat-bound names
+-- across the wire chain. Without this, lemmas like
+-- `injective_agreement(I, R, [ni, nr])` falsify on protocols
+-- like NSL because the two sides emit Running/Commit events
+-- with structurally-different (but semantically-equal) payloads
+-- that the matcher can't bridge.
+--------------------------------------------------------------------------------
+
+-- | For each step that has both a `new n` and a `send <expr>`
+-- where `expr` mentions `n`, return per-(principal, step label)
+-- chain events. The sender gets a 'ChainSource' carrying the
+-- whole send expression; the receiver (if the step is a network
+-- step) gets a matching 'ChainSink' with the same expression.
+computeChainEvents
+  :: Protocol -> M.Map (T.Text, T.Text) [ChainEvent]
+computeChainEvents p =
+  M.fromListWith (++) (concatMap forStep (protoSteps p))
+  where
+    forStep :: Step -> [((T.Text, T.Text), [ChainEvent])]
+    forStep s =
+      let body      = stepBody s
+          freshes   = [ n | SNew n _ <- body ]
+          sentExprs = [ e | SSend e _ <- body ]
+          chained   = [ e | e <- sentExprs
+                          , any (`Set.member` collectVarsExpr e) freshes ]
+          sender    = stepFrom s
+          mReceiver = case stepKind s of
+            StepNetwork tgt _ -> Just tgt
+            _                 -> Nothing
+          srcEvents = [ ChainSource e | e <- chained ]
+          snkEvents = [ ChainSink   e | e <- chained ]
+      in  [ ((sender, stepLabel s), srcEvents)
+          | not (null srcEvents)
+          ]
+       ++ [ ((rcv,    stepLabel s), snkEvents)
+          | Just rcv <- [mReceiver]
+          , not (null snkEvents)
+          ]
+
+-- | Append the chain events for the current (principal, step)
+-- pair. Each event becomes a Sapic 'Event' action whose payload
+-- is the WHOLE @SSend@ expression — lowered against the current
+-- principal's context (so the sender's side uses local fresh
+-- vars and the receiver's side uses pat-prefixed names).
+appendChainEvents
+  :: LowerCtx -> T.Text -> PlainProcess -> PlainProcess
+appendChainEvents ctx label k =
+  let key    = (lcCurrentPrincipal ctx, label)
+      events = M.findWithDefault [] key (lcChainMap ctx)
+  in  foldr wrap k events
+  where
+    wrap (ChainSource e) acc =
+      ProcessAction
+        (Event (chainFact "ChainSrc" (lowerExpr ctx e)))
+        mempty acc
+    wrap (ChainSink e)   acc =
+      ProcessAction
+        (Event (chainFact "ChainSnk" (lowerExprPat ctx e)))
+        mempty acc
+
+-- | Build a @ChainSrc(message)@ or @ChainSnk(message)@ event fact.
+-- The single argument is the whole-message Sapic term for the
+-- send expression that triggered the chain.
+chainFact :: String -> SapicNTerm SapicLVar -> SapicNFact SapicLVar
+chainFact tag term = protoFact Linear tag [term]
+
+--------------------------------------------------------------------------------
 
 -- | Build a Running/Commit action fact whose third argument is a
 -- 3-tuple @\<\'I\', \'R\', \<agreed_terms\>\>@. The lemma template's

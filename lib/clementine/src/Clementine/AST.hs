@@ -22,7 +22,7 @@ data SrcPos = SrcPos
   { spFile :: !FilePath
   , spLine :: !Int
   , spCol  :: !Int
-  } deriving (Eq, Show)
+  } deriving (Eq, Ord, Show)
 
 -- | A whole protocol declaration.
 data Protocol = Protocol
@@ -121,7 +121,7 @@ data Expr
     EApp   !PrimOp ![Expr] !SrcPos
   | -- | DH exponentiation, written infix in surface syntax: @e ^ e@.
     EExp   !Expr !Expr !SrcPos
-  deriving (Show)
+  deriving (Show, Eq)
 
 -- | The cryptographic primitive operators recognised in step bodies.
 data PrimOp
